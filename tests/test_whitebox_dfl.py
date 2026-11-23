@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 
 import numpy as np
@@ -16,6 +18,12 @@ if str(ROOT / "src") not in sys.path:
 
 from csi500_alpha.backtest import BarQuote, run_backtest
 from csi500_alpha.factors import align_industry_pit, align_quarterly_pit
+from csi500_alpha.fetch_csi500 import (
+    _standardize_bs_hfq,
+    _standardize_bs_raw,
+    _to_iso_date,
+    collect_unique_member_codes,
+)
 from csi500_alpha.models import WhiteboxDFL
 from csi500_alpha.projection import (
     DifferentiableIEProjection,
@@ -167,6 +175,119 @@ class TestWhiteboxDFL(unittest.TestCase):
         pbo, med_rank, splits = cscv_pbo(mat, n_blocks=16, max_splits=100)
         self.assertEqual(splits, 100)
         self.assertTrue(0.0 <= pbo <= 1.0 and 0.0 <= med_rank <= 1.0)
+
+    def test_baostock_bar_and_valuation_standardization(self) -> None:
+        self.assertEqual(_to_iso_date("20140601"), "2014-06-01")
+        self.assertEqual(_to_iso_date("2025-12-31"), "2025-12-31")
+
+        raw_input = pd.DataFrame([
+            {
+                "date": "2024-01-02",
+                "code": "sz.000001",
+                "open": "10.0",
+                "high": "10.6",
+                "low": "9.9",
+                "close": "10.5",
+                "preclose": "10.0",
+                "volume": "1000000",
+                "amount": "10500000.0",
+                "adjustflag": "3",
+                "turn": "1.5",
+                "tradestatus": "1",
+                "pctChg": "5.0",
+                "peTTM": "6.5",
+                "pbMRQ": "0.75",
+                "psTTM": "1.2",
+                "isST": "0",
+            },
+            {
+                "date": "2024-01-03",
+                "code": "sz.000001",
+                "open": "10.5",
+                "high": "10.5",
+                "low": "10.5",
+                "close": "10.5",
+                "preclose": "10.5",
+                "volume": "",
+                "amount": "",
+                "adjustflag": "3",
+                "turn": "",
+                "tradestatus": "0",
+                "pctChg": "0.0",
+                "peTTM": "6.5",
+                "pbMRQ": "0.75",
+                "psTTM": "1.2",
+                "isST": "0",
+            },
+            {
+                "date": "2024-01-04",
+                "code": "sz.000001",
+                "open": "21.0",
+                "high": "21.0",
+                "low": "21.0",
+                "close": "21.0",
+                "preclose": "20.0",
+                "volume": "100",
+                "amount": "2100",
+                "adjustflag": "1",
+                "turn": "0.1",
+                "tradestatus": "1",
+                "pctChg": "5.0",
+                "peTTM": "6.6",
+                "pbMRQ": "0.76",
+                "psTTM": "1.2",
+                "isST": "0",
+            },
+        ])
+        raw_out, val_out = _standardize_bs_raw(raw_input, "sz.000001")
+        self.assertEqual(len(raw_out), 2)
+        self.assertAlmostEqual(float(raw_out.loc[0, "change_amt"]), 0.5, places=6)
+        self.assertEqual(float(raw_out.loc[0, "tradestatus"]), 1.0)
+        self.assertEqual(float(raw_out.loc[1, "tradestatus"]), 0.0)
+        self.assertTrue(pd.isna(raw_out.loc[1, "turn"]) and pd.isna(raw_out.loc[1, "volume"]))
+        self.assertAlmostEqual(float(val_out.loc[0, "float_mv"]), 10500000.0 / 0.015, places=2)
+        self.assertAlmostEqual(float(val_out.loc[0, "pe_ttm"]), 6.5, places=6)
+        self.assertAlmostEqual(float(val_out.loc[0, "pb_mrq"]), 0.75, places=6)
+        self.assertTrue(pd.isna(val_out.loc[1, "float_mv"]))
+
+        hfq_input = pd.DataFrame([
+            {
+                "date": "2022-01-25",
+                "code": "sh.688223",
+                "open": "10.0",
+                "high": "10.5",
+                "low": "9.8",
+                "close": "10.2",
+                "volume": "100",
+                "amount": "1000",
+                "adjustflag": "1",
+                "turn": "0.5",
+            },
+            {
+                "date": "2022-01-26",
+                "code": "sh.688223",
+                "open": "5.0",
+                "high": "5.2",
+                "low": "4.9",
+                "close": "5.1",
+                "volume": "200",
+                "amount": "1000",
+                "adjustflag": "3",
+                "turn": "0.5",
+            },
+        ])
+        hfq_out = _standardize_bs_hfq(hfq_input, "sh.688223")
+        self.assertEqual(len(hfq_out), 1)
+        self.assertEqual(hfq_out.loc[0, "date"], pd.Timestamp("2022-01-25"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            raw_dir = Path(tmp)
+            mem_dir = raw_dir / "members"
+            mem_dir.mkdir(parents=True)
+            (mem_dir / "metadata.json").write_text(json.dumps({"pit_members": True}), encoding="utf-8")
+            pd.DataFrame({"code": ["sh.600000", "sz.000001"]}).to_parquet(mem_dir / "2024-01-05.parquet", index=False)
+            pd.DataFrame({"code": ["sz.300001"]}).to_parquet(mem_dir / "csindex_latest.parquet", index=False)
+            self.assertEqual(collect_unique_member_codes(raw_dir), ["sh.600000", "sz.000001"])
 
 
 if __name__ == "__main__":

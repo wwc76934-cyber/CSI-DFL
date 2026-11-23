@@ -202,7 +202,7 @@ def _expand_weekly_members(raw_dir: Path, schedule: pd.DataFrame) -> tuple[pd.Da
 
     if pit:
         snaps = []
-        for f in sorted(mem_dir.glob("*.parquet")):
+        for f in sorted(mem_dir.glob("20*.parquet")):
             df = pd.read_parquet(f)
             df["snapshot_date"] = _to_ns(df["snapshot_date"])
             snaps.append(df[["snapshot_date", "code", "updateDate"]])
@@ -348,8 +348,13 @@ def load_and_build_csi500_dataset(cfg: dict[str, Any], raw_dir: Path) -> tuple[p
         bars["float_mv"] = np.nan
 
     bars = bars.sort_values(["code", "date"]).reset_index(drop=True)
-    # Reconstruct raw preclose accurately using Eastmoney change_amt or hfq adjustment continuity
-    bars["raw_preclose"] = bars["raw_close"] - bars["change_amt"]
+    # Reconstruct raw preclose accurately: BaoStock preclose -> close - change_amt -> hfq adjustment continuity
+    if "preclose" in bars.columns:
+        bars["raw_preclose"] = pd.to_numeric(bars["preclose"], errors="coerce")
+        missing_pre = bars["raw_preclose"].isna() | bars["raw_preclose"].le(0)
+        bars.loc[missing_pre, "raw_preclose"] = (bars["raw_close"] - bars["change_amt"]).loc[missing_pre]
+    else:
+        bars["raw_preclose"] = bars["raw_close"] - bars["change_amt"]
     adj_ratio = (bars["hfq_close"] / bars["raw_close"].where(bars["raw_close"].gt(0)))
     prev_adj_ratio = adj_ratio.groupby(bars["code"]).shift(1)
     prev_raw_close = bars.groupby("code")["raw_close"].shift(1)
@@ -357,12 +362,18 @@ def load_and_build_csi500_dataset(cfg: dict[str, Any], raw_dir: Path) -> tuple[p
     bad_pre = bars["raw_preclose"].isna() | bars["raw_preclose"].le(0)
     bars.loc[bad_pre, "raw_preclose"] = fallback_pre.loc[bad_pre]
 
+    tradestatus_ok = (
+        bars["tradestatus"].isna() | pd.to_numeric(bars["tradestatus"], errors="coerce").eq(1)
+        if "tradestatus" in bars.columns
+        else True
+    )
     bars["bar_ok"] = (
         bars["raw_open"].gt(0) & bars["raw_close"].gt(0)
         & bars["hfq_open"].gt(0) & bars["hfq_close"].gt(0)
         & bars["hfq_high"].ge(bars[["hfq_open", "hfq_close", "hfq_low"]].max(axis=1))
         & bars["hfq_low"].le(bars[["hfq_open", "hfq_close"]].min(axis=1))
         & bars["volume"].gt(0)
+        & tradestatus_ok
     )
 
     # Load shared incremental data (industry & quarterly reports)

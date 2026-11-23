@@ -10,9 +10,102 @@ import subprocess
 import sys
 import time
 
+import numpy as np
 import pandas as pd
 
 from .config import load_config, project_root
+
+
+BS_RAW_FIELDS = (
+    "date,code,open,high,low,close,preclose,volume,amount,"
+    "adjustflag,turn,tradestatus,pctChg,peTTM,pbMRQ,psTTM,isST"
+)
+BS_HFQ_FIELDS = "date,code,open,high,low,close,volume,amount,adjustflag,turn"
+
+
+def _to_iso_date(value: str) -> str:
+    digits = "".join(ch for ch in str(value) if ch.isdigit())
+    if len(digits) != 8:
+        raise ValueError(f"Expected YYYYMMDD or YYYY-MM-DD date string, got {value!r}")
+    return f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}"
+
+
+class _BoundedSocket(socket.socket):
+    def recv(self, *args):
+        data = super().recv(*args)
+        if not data:
+            raise ConnectionError("BaoStock closed its connection")
+        return data
+
+
+class BaoSession:
+    """Managed BaoStock session with bounded socket timeout and automatic reconnect."""
+
+    def __init__(self, timeout: float = 20.0):
+        self.timeout = timeout
+        self._orig_socket = None
+        self._orig_timeout: float | None = None
+        self.api = None
+        self.context = None
+        self.connected = False
+
+    def __enter__(self) -> "BaoSession":
+        import baostock as bs
+        import baostock.common.context as context
+
+        self.api = bs
+        self.context = context
+        self._orig_socket = socket.socket
+        self._orig_timeout = socket.getdefaulttimeout()
+        socket.socket = _BoundedSocket
+        socket.setdefaulttimeout(self.timeout)
+        return self
+
+    def close(self) -> None:
+        if self.context is not None:
+            conn = getattr(self.context, "default_socket", None)
+            if conn is not None:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+        self.connected = False
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self.connected and self.api is not None:
+            try:
+                self.api.logout()
+            except Exception:
+                pass
+        self.close()
+        if self._orig_socket is not None:
+            socket.socket = self._orig_socket
+        socket.setdefaulttimeout(self._orig_timeout)
+
+    def query(self, method: str, label: str, *args, empty: bool = False, **kwargs) -> pd.DataFrame:
+        for attempt in range(3):
+            try:
+                if not self.connected:
+                    res = self.api.login()
+                    if res.error_code != "0":
+                        raise ConnectionError(f"BaoStock login failed: {res.error_code} {res.error_msg}")
+                    self.connected = True
+                rs = getattr(self.api, method)(*args, **kwargs)
+                if rs.error_code != "0":
+                    raise ValueError(f"{label}: {rs.error_code} {rs.error_msg}")
+                rows = []
+                while rs.next():
+                    rows.append(rs.get_row_data())
+                if rs.error_code != "0":
+                    raise ValueError(f"{label}: {rs.error_code} {rs.error_msg}")
+                if not empty and not rows:
+                    raise ValueError(f"{label}: empty response")
+                return pd.DataFrame(rows, columns=rs.fields)
+            except (ValueError, OSError, ConnectionError) as err:
+                self.close()
+                if attempt == 2:
+                    raise RuntimeError(f"{label}: {err}") from err
+                time.sleep(attempt + 1)
 
 
 def normalize_a_share_code(raw_code: str) -> str:
@@ -144,65 +237,51 @@ def fetch_members(
             print(f"[members] Using cached {target}", flush=True)
         return mem_dir
 
-    # Default: BaoStock true Point-in-Time month-end snapshots (2014-12 .. 2025-12)
-    import baostock as bs
+    # Default: BaoStock true Point-in-Time weekly snapshots matching schedule.parquet (2015-01 .. 2025-12)
+    sched_path = raw_dir / "schedule.parquet"
+    if not sched_path.exists():
+        raise FileNotFoundError("Missing schedule.parquet; run --step index first.")
+    sched = pd.read_parquet(sched_path, columns=["signal_date"])
+    sig_days = pd.to_datetime(sched["signal_date"]).sort_values().unique()
+    snap_dates = [
+        pd.Timestamp(d) for d in sig_days if pd.Timestamp("2015-01-01") <= pd.Timestamp(d) <= pd.Timestamp("2025-12-31")
+    ]
 
-    cal_path = raw_dir / "calendar.parquet"
-    if not cal_path.exists():
-        raise FileNotFoundError("Missing calendar.parquet; run --step index first.")
-    cal = pd.read_parquet(cal_path)
-    days = pd.to_datetime(cal["date"]).sort_values()
-    month_ends = days.groupby(days.dt.to_period("M")).max()
-    snap_dates = [d for d in month_ends if pd.Timestamp("2014-12-01") <= d <= pd.Timestamp("2025-12-31")]
-
-    socket.setdefaulttimeout(20)
-    lg = bs.login()
-    if lg.error_code != "0":
-        raise RuntimeError(
-            f"BaoStock login failed [{lg.error_code}] {lg.error_msg}. "
-            "If BaoStock stays unreachable, you may rerun with --members-source csindex (non-PIT fallback)."
-        )
-    try:
-        written = 0
-        for idx, d in enumerate(snap_dates, 1):
-            tag = d.strftime("%Y-%m-%d")
-            target = mem_dir / f"{tag}.parquet"
-            if target.exists() and not force:
-                continue
-            rs = bs.query_zz500_stocks(date=tag)
-            if rs.error_code != "0":
-                raise RuntimeError(f"query_zz500_stocks({tag}) failed [{rs.error_code}] {rs.error_msg}")
-            rows = []
-            while rs.next():
-                rows.append(rs.get_row_data())
-            if not rows:
-                raise RuntimeError(f"query_zz500_stocks({tag}) returned 0 rows")
-            df = pd.DataFrame(rows, columns=rs.fields)
-            df["snapshot_date"] = d
-            df["updateDate"] = pd.to_datetime(df["updateDate"], errors="coerce")
-            df["code"] = df["code"].astype(str).map(normalize_a_share_code)
-            _atomic_parquet(df, target)
-            written += 1
-            if written % 20 == 0 or idx == len(snap_dates):
-                print(f"[members] BaoStock PIT snapshot {idx}/{len(snap_dates)} ({tag})", flush=True)
-            time.sleep(0.05)
-    finally:
-        try:
-            bs.logout()
-        except Exception:
-            pass
+    pending = [d for d in snap_dates if force or not (mem_dir / f"{d.strftime('%Y-%m-%d')}.parquet").exists()]
+    if pending:
+        with BaoSession() as session:
+            for idx, d in enumerate(pending, 1):
+                tag = d.strftime("%Y-%m-%d")
+                target = mem_dir / f"{tag}.parquet"
+                df = session.query("query_zz500_stocks", f"zz500 {tag}", date=tag, empty=False)
+                df["snapshot_date"] = d
+                df["updateDate"] = pd.to_datetime(df["updateDate"], errors="coerce")
+                df["code"] = df["code"].astype(str).map(normalize_a_share_code)
+                _atomic_parquet(df, target)
+                if idx % 50 == 0 or idx == len(pending):
+                    print(f"[members] BaoStock weekly PIT snapshot {idx}/{len(pending)} ({tag})", flush=True)
+                time.sleep(0.02)
 
     meta_path.write_text(
-        json.dumps({"source": "baostock", "pit_members": True, "snapshots": len(snap_dates)}, indent=2),
+        json.dumps({"source": "baostock", "pit_members": True, "frequency": "weekly", "snapshots": len(snap_dates)}, indent=2),
         encoding="utf-8",
     )
-    print(f"[members] Ready {len(snap_dates)} BaoStock PIT CSI 500 snapshots (pit_members=True)", flush=True)
+    print(f"[members] Ready {len(snap_dates)} BaoStock weekly PIT CSI 500 snapshots (pit_members=True)", flush=True)
     return mem_dir
 
 
 def collect_unique_member_codes(raw_dir: Path) -> list[str]:
     mem_dir = raw_dir / "members"
-    files = sorted(mem_dir.glob("*.parquet"))
+    meta_path = mem_dir / "metadata.json"
+    files: list[Path] = []
+    if meta_path.exists():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if meta.get("pit_members") is True:
+            files = sorted(mem_dir.glob("20*.parquet"))
+        elif meta.get("pit_members") is False and (mem_dir / "csindex_latest.parquet").exists():
+            files = [mem_dir / "csindex_latest.parquet"]
+    if not files:
+        files = sorted(mem_dir.glob("*.parquet"))
     if not files:
         raise FileNotFoundError(f"No member parquet files in {mem_dir}; run --step members first.")
     codes: set[str] = set()
@@ -210,6 +289,119 @@ def collect_unique_member_codes(raw_dir: Path) -> list[str]:
         df = pd.read_parquet(f, columns=["code"])
         codes.update(df["code"].astype(str).tolist())
     return sorted(codes)
+
+
+def _standardize_bs_raw(
+    df: pd.DataFrame,
+    code: str,
+    end_date: str | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    raw_cols = [
+        "date", "code", "open", "close", "high", "low", "preclose",
+        "volume", "amount", "turn", "change_amt", "pct_chg", "tradestatus", "is_st",
+    ]
+    val_cols = ["date", "code", "pe_ttm", "pb_mrq", "ps_ttm", "float_mv"]
+    if df is None or df.empty:
+        return pd.DataFrame(columns=raw_cols), pd.DataFrame(columns=val_cols)
+
+    work = df.copy()
+    if "adjustflag" in work.columns:
+        work = work.loc[work["adjustflag"].astype(str).str.strip().eq("3")].copy()
+    if work.empty:
+        return pd.DataFrame(columns=raw_cols), pd.DataFrame(columns=val_cols)
+
+    work["_dt"] = pd.to_datetime(work["date"], errors="coerce")
+    work = work.loc[work["_dt"].notna()]
+    if end_date is not None:
+        work = work.loc[work["_dt"].le(pd.Timestamp(_to_iso_date(end_date)))]
+    work = work.sort_values("_dt").drop_duplicates("_dt").reset_index(drop=True)
+    if work.empty:
+        return pd.DataFrame(columns=raw_cols), pd.DataFrame(columns=val_cols)
+
+    def num(col: str) -> pd.Series:
+        if col not in work.columns:
+            return pd.Series(np.nan, index=work.index, dtype="float64")
+        return pd.to_numeric(work[col], errors="coerce")
+
+    close_s = num("close")
+    preclose_s = num("preclose")
+    amount_s = num("amount")
+    turn_s = num("turn")
+    float_mv_s = pd.Series(
+        np.where(turn_s.gt(0) & turn_s.le(100) & amount_s.gt(0), amount_s / (turn_s / 100.0), np.nan),
+        index=work.index,
+        dtype="float64",
+    )
+
+    raw_out = pd.DataFrame({
+        "date": work["_dt"],
+        "code": code,
+        "open": num("open"),
+        "close": close_s,
+        "high": num("high"),
+        "low": num("low"),
+        "preclose": preclose_s,
+        "volume": num("volume"),
+        "amount": amount_s,
+        "turn": turn_s,
+        "change_amt": close_s - preclose_s,
+        "pct_chg": num("pctChg"),
+        "tradestatus": num("tradestatus"),
+        "is_st": num("isST"),
+    })[raw_cols]
+
+    val_out = pd.DataFrame({
+        "date": work["_dt"],
+        "code": code,
+        "pe_ttm": num("peTTM"),
+        "pb_mrq": num("pbMRQ"),
+        "ps_ttm": num("psTTM"),
+        "float_mv": float_mv_s,
+    })[val_cols]
+    return raw_out, val_out
+
+
+def _standardize_bs_hfq(
+    df: pd.DataFrame,
+    code: str,
+    end_date: str | None = None,
+) -> pd.DataFrame:
+    cols = ["date", "code", "open", "close", "high", "low", "volume", "amount", "turn", "change_amt", "pct_chg"]
+    if df is None or df.empty:
+        return pd.DataFrame(columns=cols)
+
+    work = df.copy()
+    if "adjustflag" in work.columns:
+        work = work.loc[work["adjustflag"].astype(str).str.strip().eq("1")].copy()
+    if work.empty:
+        return pd.DataFrame(columns=cols)
+
+    work["_dt"] = pd.to_datetime(work["date"], errors="coerce")
+    work = work.loc[work["_dt"].notna()]
+    if end_date is not None:
+        work = work.loc[work["_dt"].le(pd.Timestamp(_to_iso_date(end_date)))]
+    work = work.sort_values("_dt").drop_duplicates("_dt").reset_index(drop=True)
+    if work.empty:
+        return pd.DataFrame(columns=cols)
+
+    def num(col: str) -> pd.Series:
+        if col not in work.columns:
+            return pd.Series(np.nan, index=work.index, dtype="float64")
+        return pd.to_numeric(work[col], errors="coerce")
+
+    return pd.DataFrame({
+        "date": work["_dt"],
+        "code": code,
+        "open": num("open"),
+        "close": num("close"),
+        "high": num("high"),
+        "low": num("low"),
+        "volume": num("volume"),
+        "amount": num("amount"),
+        "turn": num("turn"),
+        "change_amt": float("nan"),
+        "pct_chg": float("nan"),
+    })[cols]
 
 
 def _standardize_tx_bars(df: pd.DataFrame, code: str) -> pd.DataFrame:
@@ -236,17 +428,91 @@ def fetch_bars(
     raw_dir: Path,
     start_date: str = "20140601",
     end_date: str = "20251231",
+    source: str = "baostock",
     force: bool = False,
-    sleep_sec: float = 0.08,
+    sleep_sec: float = 0.02,
 ) -> None:
-    """Fetch raw and hfq daily bars for all CSI 500 historical/current constituent codes."""
-    import akshare as ak
-
+    """Fetch raw and hfq daily bars (plus valuations when using BaoStock) for all CSI 500 constituent codes."""
     codes = collect_unique_member_codes(raw_dir)
     raw_out = raw_dir / "bars_raw"
     hfq_out = raw_dir / "bars_hfq"
+    val_out = raw_dir / "valuations"
     raw_out.mkdir(parents=True, exist_ok=True)
     hfq_out.mkdir(parents=True, exist_ok=True)
+
+    if source == "baostock":
+        val_out.mkdir(parents=True, exist_ok=True)
+        start_iso = _to_iso_date(start_date)
+        end_iso = _to_iso_date(end_date)
+        pending = [
+            c
+            for c in codes
+            if force
+            or not (
+                (raw_out / f"{c}.parquet").exists()
+                and (hfq_out / f"{c}.parquet").exists()
+                and (val_out / f"{c}.parquet").exists()
+            )
+        ]
+        if not pending:
+            print(f"[bars] All {len(codes)} codes already cached (bars_raw, bars_hfq, valuations)!", flush=True)
+            return
+
+        failed = []
+        with BaoSession() as session:
+            for idx, code in enumerate(pending, 1):
+                rf = raw_out / f"{code}.parquet"
+                hf = hfq_out / f"{code}.parquet"
+                vf = val_out / f"{code}.parquet"
+                try:
+                    fetched = False
+                    if force or not rf.exists() or not vf.exists():
+                        df_bs_raw = session.query(
+                            "query_history_k_data_plus",
+                            f"{code} raw+val",
+                            code,
+                            BS_RAW_FIELDS,
+                            start_date=start_iso,
+                            end_date=end_iso,
+                            frequency="d",
+                            adjustflag="3",
+                            empty=True,
+                        )
+                        raw_df, val_df = _standardize_bs_raw(df_bs_raw, code, end_date=end_iso)
+                        _atomic_parquet(raw_df, rf)
+                        _atomic_parquet(val_df, vf)
+                        fetched = True
+                    if force or not hf.exists():
+                        df_bs_hfq = session.query(
+                            "query_history_k_data_plus",
+                            f"{code} hfq",
+                            code,
+                            BS_HFQ_FIELDS,
+                            start_date=start_iso,
+                            end_date=end_iso,
+                            frequency="d",
+                            adjustflag="1",
+                            empty=True,
+                        )
+                        hfq_df = _standardize_bs_hfq(df_bs_hfq, code, end_date=end_iso)
+                        _atomic_parquet(hfq_df, hf)
+                        fetched = True
+                    if fetched and sleep_sec > 0:
+                        time.sleep(sleep_sec)
+                except Exception as exc:
+                    failed.append({"code": code, "error": str(exc)})
+
+                if idx % 50 == 0 or idx == len(pending):
+                    print(f"[bars] BaoStock progress {idx}/{len(pending)} (total={len(codes)}, failed={len(failed)})", flush=True)
+
+        if failed:
+            pd.DataFrame(failed).to_csv(raw_dir / "bars_errors.csv", index=False, encoding="utf-8-sig")
+            print(f"[bars] Finished with {len(failed)} failed codes logged to {raw_dir / 'bars_errors.csv'}", flush=True)
+        else:
+            print(f"[bars] All {len(codes)} codes ready via BaoStock (bars_raw, bars_hfq, valuations)!", flush=True)
+        return
+
+    import akshare as ak
 
     failed = []
     for idx, code in enumerate(codes, 1):
@@ -288,17 +554,58 @@ def fetch_bars(
 def fetch_valuations(
     raw_dir: Path,
     end_date: str = "2025-12-31",
+    source: str = "baostock",
     force: bool = False,
-    sleep_sec: float = 0.08,
+    sleep_sec: float = 0.02,
 ) -> None:
-    """Fetch daily valuation metrics (PE_TTM, PB_MRQ, FloatMV) via ak.stock_value_em."""
-    import akshare as ak
-
+    """Fetch daily valuation metrics (PE_TTM, PB_MRQ, FloatMV) via BaoStock or AKShare fallback."""
     codes = collect_unique_member_codes(raw_dir)
     val_dir = raw_dir / "valuations"
     val_dir.mkdir(parents=True, exist_ok=True)
-    end_ts = pd.Timestamp(end_date)
 
+    if source == "baostock":
+        end_iso = _to_iso_date(end_date)
+        pending = [c for c in codes if force or not (val_dir / f"{c}.parquet").exists()]
+        if not pending:
+            print(f"[valuations] All {len(codes)} codes already populated by BaoStock bars step!", flush=True)
+            return
+
+        failed = []
+        with BaoSession() as session:
+            for idx, code in enumerate(pending, 1):
+                vf = val_dir / f"{code}.parquet"
+                try:
+                    df_bs_raw = session.query(
+                        "query_history_k_data_plus",
+                        f"{code} val",
+                        code,
+                        BS_RAW_FIELDS,
+                        start_date="2014-06-01",
+                        end_date=end_iso,
+                        frequency="d",
+                        adjustflag="3",
+                        empty=True,
+                    )
+                    _, val_df = _standardize_bs_raw(df_bs_raw, code, end_date=end_iso)
+                    _atomic_parquet(val_df, vf)
+                    if sleep_sec > 0:
+                        time.sleep(sleep_sec)
+                except Exception as exc:
+                    failed.append({"code": code, "error": str(exc)})
+
+                if idx % 50 == 0 or idx == len(pending):
+                    print(f"[valuations] BaoStock progress {idx}/{len(pending)} (total={len(codes)}, failed={len(failed)})", flush=True)
+
+        if failed:
+            pd.DataFrame(failed).to_csv(raw_dir / "valuations_errors.csv", index=False, encoding="utf-8-sig")
+            print(f"[valuations] Finished with {len(failed)} failed codes logged to {raw_dir / 'valuations_errors.csv'}", flush=True)
+        else:
+            print(f"[valuations] All {len(codes)} codes ready via BaoStock!", flush=True)
+        return
+
+    import akshare as ak
+
+    end_ts = pd.Timestamp(end_date)
     failed = []
     for idx, code in enumerate(codes, 1):
         vf = val_dir / f"{code}.parquet"
@@ -343,31 +650,50 @@ def fetch_valuations(
 
 
 def _probe_baostock_zz500() -> None:
-    import baostock as bs
+    with BaoSession() as session:
+        df_2015 = session.query("query_zz500_stocks", "zz500 2015-01-09", date="2015-01-09", empty=False)
+        df_2024 = session.query("query_zz500_stocks", "zz500 2024-01-05", date="2024-01-05", empty=False)
+        print(
+            f"   BaoStock PIT query_zz500_stocks OK: 2015-01-09={len(df_2015)} rows, 2024-01-05={len(df_2024)} rows",
+            flush=True,
+        )
 
-    socket.setdefaulttimeout(20)
-    lg = bs.login()
-    if lg.error_code != "0":
-        raise RuntimeError(f"BaoStock login failed [{lg.error_code}] {lg.error_msg}")
-    try:
-        rs = bs.query_zz500_stocks(date="2024-01-05")
-        if rs.error_code != "0":
-            raise RuntimeError(f"query_zz500_stocks failed [{rs.error_code}] {rs.error_msg}")
-        rows = []
-        while rs.next():
-            rows.append(rs.get_row_data())
-        print(f"   BaoStock query_zz500_stocks OK: {len(rows)} rows")
-    finally:
-        try:
-            bs.logout()
-        except Exception:
-            pass
+        df_raw = session.query(
+            "query_history_k_data_plus",
+            "sz.000001 raw+val 2015-01",
+            "sz.000001",
+            BS_RAW_FIELDS,
+            start_date="2015-01-05",
+            end_date="2015-01-30",
+            frequency="d",
+            adjustflag="3",
+            empty=False,
+        )
+        df_hfq = session.query(
+            "query_history_k_data_plus",
+            "sz.000001 hfq 2015-01",
+            "sz.000001",
+            BS_HFQ_FIELDS,
+            start_date="2015-01-05",
+            end_date="2015-01-30",
+            frequency="d",
+            adjustflag="1",
+            empty=False,
+        )
+        raw_std, val_std = _standardize_bs_raw(df_raw, "sz.000001")
+        hfq_std = _standardize_bs_hfq(df_hfq, "sz.000001")
+        print(
+            f"   BaoStock bars sz.000001 (2015-01): raw={len(raw_std)}, hfq={len(hfq_std)}, "
+            f"preclose={int(raw_std['preclose'].notna().sum())}, pe_ttm={int(val_std['pe_ttm'].notna().sum())}, "
+            f"pb_mrq={int(val_std['pb_mrq'].notna().sum())}, float_mv={int(val_std['float_mv'].notna().sum())}",
+            flush=True,
+        )
 
 
 def probe_apis() -> None:
     import akshare as ak
 
-    print("[1/4] Probing AKShare CSI 500 index (H00905 & 000905)...", flush=True)
+    print("[1/3] Probing AKShare CSI 500 index (H00905 & 000905)...", flush=True)
     try:
         df_tr = ak.index_hist_csindex(symbol="H00905", start_date="20240101", end_date="20240131")
         df_px = ak.index_hist_csindex(symbol="000905", start_date="20240101", end_date="20240131")
@@ -375,21 +701,7 @@ def probe_apis() -> None:
     except Exception as exc:
         print(f"   [FAIL] {exc}", flush=True)
 
-    print("[2/4] Probing AKShare daily bars (stock_zh_a_hist_tx)...", flush=True)
-    try:
-        df_b = ak.stock_zh_a_hist_tx(symbol="sz000001", start_date="20240101", end_date="20240131", adjust="")
-        print(f"   rows={len(df_b)}, cols={list(df_b.columns)}", flush=True)
-    except Exception as exc:
-        print(f"   [FAIL] {exc}", flush=True)
-
-    print("[3/4] Probing AKShare valuation history (stock_value_em)...", flush=True)
-    try:
-        df_v = ak.stock_value_em(symbol="000001")
-        print(f"   rows={len(df_v)}, range={df_v['数据日期'].min()}..{df_v['数据日期'].max()}", flush=True)
-    except Exception as exc:
-        print(f"   [FAIL] {exc}", flush=True)
-
-    print("[4/4] Probing CSI 500 constituents (BaoStock 30s timeout vs CSIndex fallback)...", flush=True)
+    print("[2/3] Probing BaoStock PIT CSI 500 constituents & 2015 daily bars/valuations (30s timeout)...", flush=True)
     try:
         probe_env = {**os.environ, "PYTHONPATH": str(project_root() / "src")}
         res = subprocess.run(
@@ -397,14 +709,17 @@ def probe_apis() -> None:
             cwd=project_root(), env=probe_env, timeout=30, check=False,
         )
         if res.returncode != 0:
-            print("   [WARN] BaoStock PIT probe failed; CSIndex fallback available (--members-source csindex).", flush=True)
+            print("   [WARN] BaoStock PIT probe failed; AKShare fallback available (--members-source csindex --data-source akshare).", flush=True)
     except subprocess.TimeoutExpired:
-        print("   [WARN] BaoStock PIT probe timed out (30s); CSIndex fallback available.", flush=True)
+        print("   [WARN] BaoStock PIT probe timed out (30s); AKShare fallback available.", flush=True)
+
+    print("[3/3] Probing AKShare fallback APIs (stock_zh_a_hist_tx & index_stock_cons_csindex)...", flush=True)
     try:
+        df_b = ak.stock_zh_a_hist_tx(symbol="sz000001", start_date="20240101", end_date="20240131", adjust="")
         df_c = ak.index_stock_cons_csindex(symbol="000905")
-        print(f"   CSIndex fallback index_stock_cons_csindex('000905') OK: {len(df_c)} rows", flush=True)
+        print(f"   TX bars rows={len(df_b)}, CSIndex members rows={len(df_c)}", flush=True)
     except Exception as exc:
-        print(f"   [FAIL] CSIndex fallback failed: {exc}", flush=True)
+        print(f"   [FAIL] {exc}", flush=True)
 
 
 def print_data_summary(raw_dir: Path) -> None:

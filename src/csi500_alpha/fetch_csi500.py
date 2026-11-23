@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,8 @@ import pandas as pd
 
 from .config import load_config, project_root
 
+
+DEFAULT_V3_CACHE_DIR = Path(r"D:\QuantProjects\regime-factor\data\raw\v3\development")
 
 BS_RAW_FIELDS = (
     "date,code,open,high,low,close,preclose,volume,amount,"
@@ -39,12 +42,14 @@ class _BoundedSocket(socket.socket):
 
 
 class BaoSession:
-    """Managed BaoStock session with bounded socket timeout and automatic reconnect."""
+    """Managed BaoStock session with bounded socket timeout, guarded send_msg, and automatic reconnect."""
 
-    def __init__(self, timeout: float = 20.0):
+    def __init__(self, timeout: float = 45.0):
         self.timeout = timeout
         self._orig_socket = None
         self._orig_timeout: float | None = None
+        self._orig_send_msg = None
+        self._sock_util = None
         self.api = None
         self.context = None
         self.connected = False
@@ -52,13 +57,27 @@ class BaoSession:
     def __enter__(self) -> "BaoSession":
         import baostock as bs
         import baostock.common.context as context
+        import baostock.util.socketutil as sock_util
 
         self.api = bs
         self.context = context
+        self._sock_util = sock_util
         self._orig_socket = socket.socket
         self._orig_timeout = socket.getdefaulttimeout()
+        self._orig_send_msg = sock_util.send_msg
         socket.socket = _BoundedSocket
         socket.setdefaulttimeout(self.timeout)
+        session = self
+        orig_send_msg = self._orig_send_msg
+
+        def _guarded_send_msg(msg: str):
+            resp = orig_send_msg(msg)
+            if resp is None or (isinstance(resp, str) and resp.strip() == ""):
+                session.close()
+                raise ConnectionError("BaoStock socket send_msg failed; closed socket for reconnect")
+            return resp
+
+        sock_util.send_msg = _guarded_send_msg
         return self
 
     def close(self) -> None:
@@ -72,18 +91,22 @@ class BaoSession:
         self.connected = False
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        if self.connected and self.api is not None:
-            try:
-                self.api.logout()
-            except Exception:
-                pass
-        self.close()
-        if self._orig_socket is not None:
-            socket.socket = self._orig_socket
-        socket.setdefaulttimeout(self._orig_timeout)
+        try:
+            if self.connected and self.api is not None:
+                try:
+                    self.api.logout()
+                except Exception:
+                    pass
+            self.close()
+        finally:
+            if self._sock_util is not None and self._orig_send_msg is not None:
+                self._sock_util.send_msg = self._orig_send_msg
+            if self._orig_socket is not None:
+                socket.socket = self._orig_socket
+            socket.setdefaulttimeout(self._orig_timeout)
 
     def query(self, method: str, label: str, *args, empty: bool = False, **kwargs) -> pd.DataFrame:
-        for attempt in range(3):
+        for attempt in range(4):
             try:
                 if not self.connected:
                     res = self.api.login()
@@ -103,9 +126,9 @@ class BaoSession:
                 return pd.DataFrame(rows, columns=rs.fields)
             except (ValueError, OSError, ConnectionError) as err:
                 self.close()
-                if attempt == 2:
+                if attempt == 3:
                     raise RuntimeError(f"{label}: {err}") from err
-                time.sleep(attempt + 1)
+                time.sleep(min(6, attempt + 1))
 
 
 def normalize_a_share_code(raw_code: str) -> str:
@@ -291,6 +314,148 @@ def collect_unique_member_codes(raw_dir: Path) -> list[str]:
     return sorted(codes)
 
 
+def collect_member_date_spans(
+    raw_dir: Path,
+    start_date: str = "2014-06-01",
+    end_date: str = "2025-12-31",
+    warmup_days: int = 420,
+    tail_days: int = 60,
+) -> dict[str, tuple[pd.Timestamp, pd.Timestamp]]:
+    """Return exact [need_start, need_end] window per member code to avoid needless history fetches."""
+    start_ts = pd.Timestamp(_to_iso_date(start_date))
+    end_ts = pd.Timestamp(_to_iso_date(end_date))
+    mem_dir = raw_dir / "members"
+    meta_path = mem_dir / "metadata.json"
+    pit_members = False
+    if meta_path.exists():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        pit_members = bool(meta.get("pit_members", False))
+
+    if not pit_members:
+        return {code: (start_ts, end_ts) for code in collect_unique_member_codes(raw_dir)}
+
+    files = sorted(mem_dir.glob("20*.parquet"))
+    if not files:
+        raise FileNotFoundError(f"No PIT member parquet files in {mem_dir}; run --step members first.")
+
+    min_snap: dict[str, pd.Timestamp] = {}
+    max_snap: dict[str, pd.Timestamp] = {}
+    for f in files:
+        cols = pd.read_parquet(f)
+        if "code" not in cols.columns or cols.empty:
+            continue
+        if "snapshot_date" in cols.columns:
+            snap_vals = pd.to_datetime(cols["snapshot_date"], errors="coerce").fillna(pd.Timestamp(f.stem))
+        else:
+            snap_vals = pd.Series(pd.Timestamp(f.stem), index=cols.index)
+        grouped = pd.DataFrame({"code": cols["code"].astype(str), "snap": snap_vals}).groupby("code")["snap"].agg(["min", "max"])
+        for code, row in grouped.iterrows():
+            lo = pd.Timestamp(row["min"])
+            hi = pd.Timestamp(row["max"])
+            if code not in min_snap or lo < min_snap[code]:
+                min_snap[code] = lo
+            if code not in max_snap or hi > max_snap[code]:
+                max_snap[code] = hi
+
+    spans: dict[str, tuple[pd.Timestamp, pd.Timestamp]] = {}
+    for code in sorted(min_snap):
+        need_start = max(start_ts, min_snap[code] - pd.Timedelta(days=warmup_days))
+        need_end = min(end_ts, max_snap[code] + pd.Timedelta(days=tail_days))
+        if need_start > need_end:
+            need_start = start_ts
+        spans[code] = (need_start, need_end)
+    return spans
+
+
+def _group_missing_year_chunks(
+    missing_years: list[int],
+    need_start: pd.Timestamp,
+    need_end: pd.Timestamp,
+    max_years: int = 5,
+) -> list[tuple[str, str]]:
+    """Group sorted missing years into <=max_years contiguous ISO date ranges clipped to [need_start, need_end]."""
+    if not missing_years:
+        return []
+    years = sorted(set(missing_years))
+    runs: list[list[int]] = []
+    cur: list[int] = []
+    for yr in years:
+        if not cur or (yr == cur[-1] + 1 and len(cur) < max_years):
+            cur.append(yr)
+        else:
+            runs.append(cur)
+            cur = [yr]
+    if cur:
+        runs.append(cur)
+
+    chunks: list[tuple[str, str]] = []
+    for run in runs:
+        lo = max(need_start, pd.Timestamp(run[0], 1, 1))
+        hi = min(need_end, pd.Timestamp(run[-1], 12, 31))
+        if lo <= hi:
+            chunks.append((lo.strftime("%Y-%m-%d"), hi.strftime("%Y-%m-%d")))
+    return chunks
+
+
+def _load_v3_cached_years(
+    v3_cache_dir: Path | None,
+    code: str,
+    need_years: list[int],
+) -> tuple[list[pd.DataFrame], list[pd.DataFrame], set[int]]:
+    raw_parts: list[pd.DataFrame] = []
+    hfq_parts: list[pd.DataFrame] = []
+    cached_years: set[int] = set()
+    if v3_cache_dir is None or not v3_cache_dir.exists():
+        return raw_parts, hfq_parts, cached_years
+
+    v3_raw = v3_cache_dir / "raw"
+    v3_adj = v3_cache_dir / "adjusted"
+    if not v3_raw.exists() or not v3_adj.exists():
+        return raw_parts, hfq_parts, cached_years
+
+    for yr in need_years:
+        rf = v3_raw / str(yr) / f"{code}.parquet"
+        af = v3_adj / str(yr) / f"{code}.parquet"
+        if rf.exists() and af.exists():
+            try:
+                r_df = pd.read_parquet(rf)
+                a_df = pd.read_parquet(af)
+                if "date" in r_df.columns:
+                    r_df["date"] = pd.to_datetime(r_df["date"], errors="coerce")
+                if "date" in a_df.columns:
+                    a_df["date"] = pd.to_datetime(a_df["date"], errors="coerce")
+                raw_parts.append(r_df)
+                hfq_parts.append(a_df)
+                cached_years.add(yr)
+            except Exception:
+                continue
+    return raw_parts, hfq_parts, cached_years
+
+
+def _validate_raw_hfq_consistency(raw_df: pd.DataFrame, hfq_df: pd.DataFrame, code: str) -> None:
+    n_raw, n_hfq = len(raw_df), len(hfq_df)
+    if abs(n_raw - n_hfq) > 5:
+        raise ValueError(f"{code}: raw/hfq row mismatch ({n_raw} vs {n_hfq})")
+    if (n_raw == 0) != (n_hfq == 0) and max(n_raw, n_hfq) > 5:
+        raise ValueError(f"{code}: empty vs non-empty raw/hfq mismatch ({n_raw} vs {n_hfq})")
+    if n_raw > 0 and n_hfq > 0:
+        gap_days = abs((pd.Timestamp(raw_df["date"].max()) - pd.Timestamp(hfq_df["date"].max())).days)
+        if gap_days > 10:
+            raise ValueError(f"{code}: raw/hfq max date mismatch ({raw_df['date'].max()} vs {hfq_df['date'].max()})")
+
+
+def _is_cached_code_valid(rf: Path, hf: Path, vf: Path) -> bool:
+    if not (rf.exists() and hf.exists() and vf.exists()):
+        return False
+    try:
+        r = pd.read_parquet(rf, columns=["date"])
+        h = pd.read_parquet(hf, columns=["date"])
+        _validate_raw_hfq_consistency(r, h, rf.stem)
+        return True
+    except Exception:
+        return False
+
+
 def _standardize_bs_raw(
     df: pd.DataFrame,
     code: str,
@@ -424,6 +589,88 @@ def _standardize_tx_bars(df: pd.DataFrame, code: str) -> pd.DataFrame:
     return out[cols].dropna(subset=["date"]).sort_values("date").drop_duplicates("date").reset_index(drop=True)
 
 
+def _fetch_bs_bars_shard(
+    shard_tasks: list[tuple[str, str, str, bool]],
+    raw_dir: Path,
+    end_iso: str,
+    sleep_sec: float,
+    v3_cache_dir: Path | None,
+    worker_id: int = 0,
+) -> list[dict[str, str]]:
+    """Worker routine to fetch missing <=5y BaoStock bar chunks and splice with any v3 cache."""
+    raw_out = raw_dir / "bars_raw"
+    hfq_out = raw_dir / "bars_hfq"
+    val_out = raw_dir / "valuations"
+    failed: list[dict[str, str]] = []
+    prefix = f"[bars:w{worker_id}]" if worker_id > 0 else "[bars]"
+
+    with BaoSession(timeout=45.0) as session:
+        for idx, (code, s_iso, e_iso, allow_v3) in enumerate(shard_tasks, 1):
+            need_start = pd.Timestamp(s_iso)
+            need_end = pd.Timestamp(e_iso)
+            need_years = list(range(need_start.year, need_end.year + 1))
+
+            raw_parts: list[pd.DataFrame] = []
+            hfq_parts: list[pd.DataFrame] = []
+            cached_years: set[int] = set()
+            if allow_v3 and v3_cache_dir is not None:
+                raw_parts, hfq_parts, cached_years = _load_v3_cached_years(v3_cache_dir, code, need_years)
+
+            missing_years = [y for y in need_years if y not in cached_years]
+            chunks = _group_missing_year_chunks(missing_years, need_start, need_end, max_years=5)
+            try:
+                for c_start, c_end in chunks:
+                    df_bs_raw = session.query(
+                        "query_history_k_data_plus",
+                        f"{code} raw+val {c_start}..{c_end}",
+                        code,
+                        BS_RAW_FIELDS,
+                        start_date=c_start,
+                        end_date=c_end,
+                        frequency="d",
+                        adjustflag="3",
+                        empty=True,
+                    )
+                    if not df_bs_raw.empty and "date" in df_bs_raw.columns:
+                        df_bs_raw["date"] = pd.to_datetime(df_bs_raw["date"], errors="coerce")
+                        raw_parts.append(df_bs_raw)
+
+                    df_bs_hfq = session.query(
+                        "query_history_k_data_plus",
+                        f"{code} hfq {c_start}..{c_end}",
+                        code,
+                        BS_HFQ_FIELDS,
+                        start_date=c_start,
+                        end_date=c_end,
+                        frequency="d",
+                        adjustflag="1",
+                        empty=True,
+                    )
+                    if not df_bs_hfq.empty and "date" in df_bs_hfq.columns:
+                        df_bs_hfq["date"] = pd.to_datetime(df_bs_hfq["date"], errors="coerce")
+                        hfq_parts.append(df_bs_hfq)
+
+                    if sleep_sec > 0:
+                        time.sleep(sleep_sec)
+
+                raw_cat = pd.concat(raw_parts, ignore_index=True) if raw_parts else pd.DataFrame()
+                hfq_cat = pd.concat(hfq_parts, ignore_index=True) if hfq_parts else pd.DataFrame()
+                raw_df, val_df = _standardize_bs_raw(raw_cat, code, end_date=end_iso)
+                hfq_df = _standardize_bs_hfq(hfq_cat, code, end_date=end_iso)
+                _validate_raw_hfq_consistency(raw_df, hfq_df, code)
+
+                _atomic_parquet(raw_df, raw_out / f"{code}.parquet")
+                _atomic_parquet(val_df, val_out / f"{code}.parquet")
+                _atomic_parquet(hfq_df, hfq_out / f"{code}.parquet")
+            except Exception as exc:
+                failed.append({"code": code, "error": str(exc)})
+
+            if idx % 25 == 0 or idx == len(shard_tasks):
+                print(f"{prefix} BaoStock progress {idx}/{len(shard_tasks)} (failed={len(failed)})", flush=True)
+
+    return failed
+
+
 def fetch_bars(
     raw_dir: Path,
     start_date: str = "20140601",
@@ -431,9 +678,10 @@ def fetch_bars(
     source: str = "baostock",
     force: bool = False,
     sleep_sec: float = 0.02,
+    v3_cache_dir: Path | None = DEFAULT_V3_CACHE_DIR,
+    workers: int = 1,
 ) -> None:
     """Fetch raw and hfq daily bars (plus valuations when using BaoStock) for all CSI 500 constituent codes."""
-    codes = collect_unique_member_codes(raw_dir)
     raw_out = raw_dir / "bars_raw"
     hfq_out = raw_dir / "bars_hfq"
     val_out = raw_dir / "valuations"
@@ -444,76 +692,94 @@ def fetch_bars(
         val_out.mkdir(parents=True, exist_ok=True)
         start_iso = _to_iso_date(start_date)
         end_iso = _to_iso_date(end_date)
+        spans = collect_member_date_spans(raw_dir, start_date=start_iso, end_date=end_iso)
+        codes = sorted(spans)
+
+        bad_cached = [
+            c
+            for c in codes
+            if not force
+            and (raw_out / f"{c}.parquet").exists()
+            and (hfq_out / f"{c}.parquet").exists()
+            and (val_out / f"{c}.parquet").exists()
+            and not _is_cached_code_valid(raw_out / f"{c}.parquet", hfq_out / f"{c}.parquet", val_out / f"{c}.parquet")
+        ]
+        if bad_cached:
+            print(
+                f"[bars] Re-queueing {len(bad_cached)} truncated/mismatched cached codes for repair: {bad_cached[:10]}",
+                flush=True,
+            )
+
         pending = [
             c
             for c in codes
-            if force
-            or not (
-                (raw_out / f"{c}.parquet").exists()
-                and (hfq_out / f"{c}.parquet").exists()
-                and (val_out / f"{c}.parquet").exists()
-            )
+            if force or not _is_cached_code_valid(raw_out / f"{c}.parquet", hfq_out / f"{c}.parquet", val_out / f"{c}.parquet")
         ]
         if not pending:
-            print(f"[bars] All {len(codes)} codes already cached (bars_raw, bars_hfq, valuations)!", flush=True)
+            print(f"[bars] All {len(codes)} codes already cached & verified (bars_raw, bars_hfq, valuations)!", flush=True)
             return
 
-        failed = []
-        with BaoSession() as session:
-            for idx, code in enumerate(pending, 1):
-                rf = raw_out / f"{code}.parquet"
-                hf = hfq_out / f"{code}.parquet"
-                vf = val_out / f"{code}.parquet"
-                try:
-                    fetched = False
-                    if force or not rf.exists() or not vf.exists():
-                        df_bs_raw = session.query(
-                            "query_history_k_data_plus",
-                            f"{code} raw+val",
-                            code,
-                            BS_RAW_FIELDS,
-                            start_date=start_iso,
-                            end_date=end_iso,
-                            frequency="d",
-                            adjustflag="3",
-                            empty=True,
-                        )
-                        raw_df, val_df = _standardize_bs_raw(df_bs_raw, code, end_date=end_iso)
-                        _atomic_parquet(raw_df, rf)
-                        _atomic_parquet(val_df, vf)
-                        fetched = True
-                    if force or not hf.exists():
-                        df_bs_hfq = session.query(
-                            "query_history_k_data_plus",
-                            f"{code} hfq",
-                            code,
-                            BS_HFQ_FIELDS,
-                            start_date=start_iso,
-                            end_date=end_iso,
-                            frequency="d",
-                            adjustflag="1",
-                            empty=True,
-                        )
-                        hfq_df = _standardize_bs_hfq(df_bs_hfq, code, end_date=end_iso)
-                        _atomic_parquet(hfq_df, hf)
-                        fetched = True
-                    if fetched and sleep_sec > 0:
-                        time.sleep(sleep_sec)
-                except Exception as exc:
-                    failed.append({"code": code, "error": str(exc)})
+        n_v3_full = 0
+        net_pending: list[tuple[str, str, str, bool]] = []
+        for code in pending:
+            need_start, need_end = spans[code]
+            s_iso = need_start.strftime("%Y-%m-%d")
+            e_iso = need_end.strftime("%Y-%m-%d")
+            need_years = list(range(need_start.year, need_end.year + 1))
 
-                if idx % 50 == 0 or idx == len(pending):
-                    print(f"[bars] BaoStock progress {idx}/{len(pending)} (total={len(codes)}, failed={len(failed)})", flush=True)
+            if v3_cache_dir is not None:
+                raw_parts, hfq_parts, cached_years = _load_v3_cached_years(v3_cache_dir, code, need_years)
+                missing_years = [y for y in need_years if y not in cached_years]
+                if not missing_years:
+                    try:
+                        raw_cat = pd.concat(raw_parts, ignore_index=True)
+                        hfq_cat = pd.concat(hfq_parts, ignore_index=True)
+                        raw_df, val_df = _standardize_bs_raw(raw_cat, code, end_date=end_iso)
+                        hfq_df = _standardize_bs_hfq(hfq_cat, code, end_date=end_iso)
+                        _validate_raw_hfq_consistency(raw_df, hfq_df, code)
+                        _atomic_parquet(raw_df, raw_out / f"{code}.parquet")
+                        _atomic_parquet(val_df, val_out / f"{code}.parquet")
+                        _atomic_parquet(hfq_df, hfq_out / f"{code}.parquet")
+                        n_v3_full += 1
+                        continue
+                    except Exception:
+                        net_pending.append((code, s_iso, e_iso, False))
+                        continue
 
+            net_pending.append((code, s_iso, e_iso, True))
+
+        if n_v3_full > 0:
+            print(f"[bars] Imported {n_v3_full} fully-cached codes locally from v3 cache", flush=True)
+
+        failed: list[dict[str, str]] = []
+        if net_pending:
+            n_workers = max(1, min(int(workers), len(net_pending)))
+            print(f"[bars] Fetching {len(net_pending)} codes via BaoStock (chunks<=5y, workers={n_workers})...", flush=True)
+            if n_workers == 1:
+                failed = _fetch_bs_bars_shard(net_pending, raw_dir, end_iso, sleep_sec, v3_cache_dir, worker_id=0)
+            else:
+                shards = [net_pending[i::n_workers] for i in range(n_workers)]
+                with ProcessPoolExecutor(max_workers=n_workers) as pool:
+                    futs = [
+                        pool.submit(_fetch_bs_bars_shard, shard, raw_dir, end_iso, sleep_sec, v3_cache_dir, i + 1)
+                        for i, shard in enumerate(shards)
+                    ]
+                    for fut in futs:
+                        failed.extend(fut.result())
+
+        err_path = raw_dir / "bars_errors.csv"
         if failed:
-            pd.DataFrame(failed).to_csv(raw_dir / "bars_errors.csv", index=False, encoding="utf-8-sig")
-            print(f"[bars] Finished with {len(failed)} failed codes logged to {raw_dir / 'bars_errors.csv'}", flush=True)
+            pd.DataFrame(failed).to_csv(err_path, index=False, encoding="utf-8-sig")
+            print(f"[bars] Finished with {len(failed)} failed codes logged to {err_path}", flush=True)
         else:
+            if err_path.exists():
+                err_path.unlink()
             print(f"[bars] All {len(codes)} codes ready via BaoStock (bars_raw, bars_hfq, valuations)!", flush=True)
         return
 
     import akshare as ak
 
+    codes = collect_unique_member_codes(raw_dir)
     failed = []
     for idx, code in enumerate(codes, 1):
         rf = raw_out / f"{code}.parquet"
@@ -559,52 +825,66 @@ def fetch_valuations(
     sleep_sec: float = 0.02,
 ) -> None:
     """Fetch daily valuation metrics (PE_TTM, PB_MRQ, FloatMV) via BaoStock or AKShare fallback."""
-    codes = collect_unique_member_codes(raw_dir)
     val_dir = raw_dir / "valuations"
     val_dir.mkdir(parents=True, exist_ok=True)
 
     if source == "baostock":
         end_iso = _to_iso_date(end_date)
+        spans = collect_member_date_spans(raw_dir, start_date="2014-06-01", end_date=end_iso)
+        codes = sorted(spans)
         pending = [c for c in codes if force or not (val_dir / f"{c}.parquet").exists()]
         if not pending:
             print(f"[valuations] All {len(codes)} codes already populated by BaoStock bars step!", flush=True)
             return
 
         failed = []
-        with BaoSession() as session:
+        with BaoSession(timeout=45.0) as session:
             for idx, code in enumerate(pending, 1):
                 vf = val_dir / f"{code}.parquet"
+                need_start, need_end = spans[code]
+                need_years = list(range(need_start.year, need_end.year + 1))
+                chunks = _group_missing_year_chunks(need_years, need_start, need_end, max_years=5)
                 try:
-                    df_bs_raw = session.query(
-                        "query_history_k_data_plus",
-                        f"{code} val",
-                        code,
-                        BS_RAW_FIELDS,
-                        start_date="2014-06-01",
-                        end_date=end_iso,
-                        frequency="d",
-                        adjustflag="3",
-                        empty=True,
-                    )
-                    _, val_df = _standardize_bs_raw(df_bs_raw, code, end_date=end_iso)
+                    parts: list[pd.DataFrame] = []
+                    for c_start, c_end in chunks:
+                        df_bs_raw = session.query(
+                            "query_history_k_data_plus",
+                            f"{code} val {c_start}..{c_end}",
+                            code,
+                            BS_RAW_FIELDS,
+                            start_date=c_start,
+                            end_date=c_end,
+                            frequency="d",
+                            adjustflag="3",
+                            empty=True,
+                        )
+                        if not df_bs_raw.empty and "date" in df_bs_raw.columns:
+                            df_bs_raw["date"] = pd.to_datetime(df_bs_raw["date"], errors="coerce")
+                            parts.append(df_bs_raw)
+                        if sleep_sec > 0:
+                            time.sleep(sleep_sec)
+                    cat = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+                    _, val_df = _standardize_bs_raw(cat, code, end_date=end_iso)
                     _atomic_parquet(val_df, vf)
-                    if sleep_sec > 0:
-                        time.sleep(sleep_sec)
                 except Exception as exc:
                     failed.append({"code": code, "error": str(exc)})
 
-                if idx % 50 == 0 or idx == len(pending):
+                if idx % 25 == 0 or idx == len(pending):
                     print(f"[valuations] BaoStock progress {idx}/{len(pending)} (total={len(codes)}, failed={len(failed)})", flush=True)
 
+        err_path = raw_dir / "valuations_errors.csv"
         if failed:
-            pd.DataFrame(failed).to_csv(raw_dir / "valuations_errors.csv", index=False, encoding="utf-8-sig")
-            print(f"[valuations] Finished with {len(failed)} failed codes logged to {raw_dir / 'valuations_errors.csv'}", flush=True)
+            pd.DataFrame(failed).to_csv(err_path, index=False, encoding="utf-8-sig")
+            print(f"[valuations] Finished with {len(failed)} failed codes logged to {err_path}", flush=True)
         else:
+            if err_path.exists():
+                err_path.unlink()
             print(f"[valuations] All {len(codes)} codes ready via BaoStock!", flush=True)
         return
 
     import akshare as ak
 
+    codes = collect_unique_member_codes(raw_dir)
     end_ts = pd.Timestamp(end_date)
     failed = []
     for idx, code in enumerate(codes, 1):
@@ -650,7 +930,7 @@ def fetch_valuations(
 
 
 def _probe_baostock_zz500() -> None:
-    with BaoSession() as session:
+    with BaoSession(timeout=20.0) as session:
         df_2015 = session.query("query_zz500_stocks", "zz500 2015-01-09", date="2015-01-09", empty=False)
         df_2024 = session.query("query_zz500_stocks", "zz500 2024-01-05", date="2024-01-05", empty=False)
         print(

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import socket
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 import pandas as pd
@@ -19,9 +21,15 @@ if str(ROOT / "src") not in sys.path:
 from csi500_alpha.backtest import BarQuote, run_backtest
 from csi500_alpha.factors import align_industry_pit, align_quarterly_pit
 from csi500_alpha.fetch_csi500 import (
+    BaoSession,
+    _group_missing_year_chunks,
+    _is_cached_code_valid,
+    _load_v3_cached_years,
     _standardize_bs_hfq,
     _standardize_bs_raw,
     _to_iso_date,
+    _validate_raw_hfq_consistency,
+    collect_member_date_spans,
     collect_unique_member_codes,
 )
 from csi500_alpha.models import WhiteboxDFL
@@ -288,6 +296,114 @@ class TestWhiteboxDFL(unittest.TestCase):
             pd.DataFrame({"code": ["sh.600000", "sz.000001"]}).to_parquet(mem_dir / "2024-01-05.parquet", index=False)
             pd.DataFrame({"code": ["sz.300001"]}).to_parquet(mem_dir / "csindex_latest.parquet", index=False)
             self.assertEqual(collect_unique_member_codes(raw_dir), ["sh.600000", "sz.000001"])
+
+    def test_baostock_chunking_consistency_and_v3_cache_reuse(self) -> None:
+        chunks_full = _group_missing_year_chunks(
+            list(range(2014, 2026)),
+            pd.Timestamp("2014-06-01"),
+            pd.Timestamp("2025-12-31"),
+            max_years=5,
+        )
+        self.assertEqual(
+            chunks_full,
+            [
+                ("2014-06-01", "2018-12-31"),
+                ("2019-01-01", "2023-12-31"),
+                ("2024-01-01", "2025-12-31"),
+            ],
+        )
+        chunks_gapped = _group_missing_year_chunks(
+            [2014, 2015, 2016, 2019, 2020, 2021, 2022, 2023, 2024, 2025],
+            pd.Timestamp("2014-06-01"),
+            pd.Timestamp("2025-12-31"),
+            max_years=5,
+        )
+        self.assertEqual(
+            chunks_gapped,
+            [
+                ("2014-06-01", "2016-12-31"),
+                ("2019-01-01", "2023-12-31"),
+                ("2024-01-01", "2025-12-31"),
+            ],
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            raw_dir = root / "raw"
+            mem_dir = raw_dir / "members"
+            mem_dir.mkdir(parents=True)
+            (mem_dir / "metadata.json").write_text(json.dumps({"pit_members": True}), encoding="utf-8")
+            pd.DataFrame({"snapshot_date": [pd.Timestamp("2020-01-10")] * 2, "code": ["sh.600000", "sh.600004"]}).to_parquet(
+                mem_dir / "2020-01-10.parquet", index=False
+            )
+            pd.DataFrame({"snapshot_date": [pd.Timestamp("2020-06-12")] * 2, "code": ["sh.600000", "sz.000001"]}).to_parquet(
+                mem_dir / "2020-06-12.parquet", index=False
+            )
+
+            spans = collect_member_date_spans(raw_dir, "2014-06-01", "2025-12-31", warmup_days=420, tail_days=60)
+            self.assertEqual(
+                spans["sh.600000"],
+                (pd.Timestamp("2020-01-10") - pd.Timedelta(days=420), pd.Timestamp("2020-06-12") + pd.Timedelta(days=60)),
+            )
+            self.assertEqual(
+                spans["sz.000001"],
+                (pd.Timestamp("2020-06-12") - pd.Timedelta(days=420), pd.Timestamp("2020-06-12") + pd.Timedelta(days=60)),
+            )
+
+            # Truncated raw (2820) vs hfq (2000) validation & cache check
+            d_2820 = pd.bdate_range("2014-06-03", periods=2820)
+            d_2000 = pd.bdate_range("2014-06-03", periods=2000)
+            r_2820 = pd.DataFrame({"date": d_2820})
+            h_2000 = pd.DataFrame({"date": d_2000})
+            with self.assertRaises(ValueError):
+                _validate_raw_hfq_consistency(r_2820, h_2000, "sh.600062")
+
+            rf = raw_dir / "sh.600062_r.parquet"
+            hf = raw_dir / "sh.600062_h.parquet"
+            vf = raw_dir / "sh.600062_v.parquet"
+            r_2820.to_parquet(rf, index=False)
+            h_2000.to_parquet(hf, index=False)
+            r_2820.to_parquet(vf, index=False)
+            self.assertFalse(_is_cached_code_valid(rf, hf, vf))
+            r_2820.to_parquet(hf, index=False)
+            self.assertTrue(_is_cached_code_valid(rf, hf, vf))
+
+            # v3 cache loader requires both raw & adjusted for a year
+            v3_dir = root / "v3"
+            (v3_dir / "raw" / "2019").mkdir(parents=True)
+            (v3_dir / "adjusted" / "2019").mkdir(parents=True)
+            (v3_dir / "raw" / "2020").mkdir(parents=True)
+            pd.DataFrame({"date": [pd.Timestamp("2019-01-02")], "close": ["10.0"]}).to_parquet(
+                v3_dir / "raw" / "2019" / "sh.600000.parquet", index=False
+            )
+            pd.DataFrame({"date": [pd.Timestamp("2019-01-02")], "close": ["20.0"]}).to_parquet(
+                v3_dir / "adjusted" / "2019" / "sh.600000.parquet", index=False
+            )
+            pd.DataFrame({"date": [pd.Timestamp("2020-01-02")], "close": ["11.0"]}).to_parquet(
+                v3_dir / "raw" / "2020" / "sh.600000.parquet", index=False
+            )
+            raw_parts, hfq_parts, cached_years = _load_v3_cached_years(v3_dir, "sh.600000", [2019, 2020])
+            self.assertEqual(cached_years, {2019})
+            self.assertEqual(len(raw_parts), 1)
+            self.assertEqual(len(hfq_parts), 1)
+
+        # Verify BaoSession guards send_msg & restores globals cleanly on exception without network calls
+        import baostock.util.socketutil as sock_util
+
+        orig_socket = socket.socket
+        orig_timeout = socket.getdefaulttimeout()
+        with mock.patch.object(sock_util, "send_msg", return_value=None) as patched_orig:
+            with self.assertRaises(RuntimeError):
+                with BaoSession(timeout=45.0) as sess:
+                    self.assertIsNot(socket.socket, orig_socket)
+                    self.assertIsNot(sock_util.send_msg, patched_orig)
+                    try:
+                        sock_util.send_msg("noop")
+                    except ConnectionError as exc:
+                        raise RuntimeError("triggered_guard") from exc
+            self.assertIs(sock_util.send_msg, patched_orig)
+        self.assertIs(socket.socket, orig_socket)
+        self.assertEqual(socket.getdefaulttimeout(), orig_timeout)
 
 
 if __name__ == "__main__":

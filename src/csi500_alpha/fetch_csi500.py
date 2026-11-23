@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import socket
 import subprocess
@@ -30,6 +31,18 @@ def normalize_a_share_code(raw_code: str) -> str:
 
 def code_to_digits(code: str) -> str:
     return "".join(ch for ch in str(code) if ch.isdigit()).zfill(6)
+
+
+def code_to_tx_symbol(code: str) -> str:
+    raw = str(code).strip().lower().replace(".", "")
+    if raw.startswith(("sh", "sz", "bj")) and len(raw) >= 8:
+        return raw[:2] + raw[2:].zfill(6)
+    digits = code_to_digits(code)
+    if digits.startswith(("6", "5")):
+        return f"sh{digits}"
+    if digits.startswith(("8", "4", "92")):
+        return f"bj{digits}"
+    return f"sz{digits}"
 
 
 def _atomic_parquet(df: pd.DataFrame, path: Path) -> None:
@@ -199,23 +212,24 @@ def collect_unique_member_codes(raw_dir: Path) -> list[str]:
     return sorted(codes)
 
 
-def _standardize_em_bars(df: pd.DataFrame, code: str) -> pd.DataFrame:
+def _standardize_tx_bars(df: pd.DataFrame, code: str) -> pd.DataFrame:
+    cols = ["date", "code", "open", "close", "high", "low", "volume", "amount", "turn", "change_amt", "pct_chg"]
     if df is None or df.empty:
-        return pd.DataFrame(columns=["date", "code", "open", "close", "high", "low", "volume", "amount", "turn", "change_amt", "pct_chg"])
+        return pd.DataFrame(columns=cols)
     out = pd.DataFrame({
-        "date": pd.to_datetime(df["日期"]),
+        "date": pd.to_datetime(df["date"], errors="coerce"),
         "code": code,
-        "open": pd.to_numeric(df["开盘"], errors="coerce"),
-        "close": pd.to_numeric(df["收盘"], errors="coerce"),
-        "high": pd.to_numeric(df["最高"], errors="coerce"),
-        "low": pd.to_numeric(df["最低"], errors="coerce"),
-        "volume": pd.to_numeric(df["成交量"], errors="coerce"),
-        "amount": pd.to_numeric(df["成交额"], errors="coerce"),
-        "turn": pd.to_numeric(df["换手率"], errors="coerce"),
-        "change_amt": pd.to_numeric(df["涨跌额"], errors="coerce"),
-        "pct_chg": pd.to_numeric(df["涨跌幅"], errors="coerce"),
+        "open": pd.to_numeric(df["open"], errors="coerce"),
+        "close": pd.to_numeric(df["close"], errors="coerce"),
+        "high": pd.to_numeric(df["high"], errors="coerce"),
+        "low": pd.to_numeric(df["low"], errors="coerce"),
+        "volume": pd.to_numeric(df["volume"], errors="coerce"),
+        "amount": pd.to_numeric(df["amount"], errors="coerce"),
+        "turn": pd.to_numeric(df["turnover"], errors="coerce") * 100.0,
+        "change_amt": float("nan"),
+        "pct_chg": float("nan"),
     })
-    return out.dropna(subset=["date"]).sort_values("date").drop_duplicates("date").reset_index(drop=True)
+    return out[cols].dropna(subset=["date"]).sort_values("date").drop_duplicates("date").reset_index(drop=True)
 
 
 def fetch_bars(
@@ -241,16 +255,16 @@ def fetch_bars(
         if rf.exists() and hf.exists() and not force:
             continue
 
-        digits = code_to_digits(code)
+        tx_sym = code_to_tx_symbol(code)
         ok = False
         for attempt in range(1, 4):
             try:
                 if not rf.exists() or force:
-                    df_raw = ak.stock_zh_a_hist_em(symbol=digits, period="daily", start_date=start_date, end_date=end_date, adjust="")
-                    _atomic_parquet(_standardize_em_bars(df_raw, code), rf)
+                    df_raw = ak.stock_zh_a_hist_tx(symbol=tx_sym, start_date=start_date, end_date=end_date, adjust="")
+                    _atomic_parquet(_standardize_tx_bars(df_raw, code), rf)
                 if not hf.exists() or force:
-                    df_hfq = ak.stock_zh_a_hist_em(symbol=digits, period="daily", start_date=start_date, end_date=end_date, adjust="hfq")
-                    _atomic_parquet(_standardize_em_bars(df_hfq, code), hf)
+                    df_hfq = ak.stock_zh_a_hist_tx(symbol=tx_sym, start_date=start_date, end_date=end_date, adjust="hfq")
+                    _atomic_parquet(_standardize_tx_bars(df_hfq, code), hf)
                 ok = True
                 break
             except Exception as exc:
@@ -361,9 +375,9 @@ def probe_apis() -> None:
     except Exception as exc:
         print(f"   [FAIL] {exc}", flush=True)
 
-    print("[2/4] Probing AKShare daily bars (stock_zh_a_hist_em)...", flush=True)
+    print("[2/4] Probing AKShare daily bars (stock_zh_a_hist_tx)...", flush=True)
     try:
-        df_b = ak.stock_zh_a_hist_em(symbol="000001", period="daily", start_date="20240101", end_date="20240131", adjust="")
+        df_b = ak.stock_zh_a_hist_tx(symbol="sz000001", start_date="20240101", end_date="20240131", adjust="")
         print(f"   rows={len(df_b)}, cols={list(df_b.columns)}", flush=True)
     except Exception as exc:
         print(f"   [FAIL] {exc}", flush=True)
@@ -377,9 +391,10 @@ def probe_apis() -> None:
 
     print("[4/4] Probing CSI 500 constituents (BaoStock 30s timeout vs CSIndex fallback)...", flush=True)
     try:
+        probe_env = {**os.environ, "PYTHONPATH": str(project_root() / "src")}
         res = subprocess.run(
             [sys.executable, "-B", "-m", "csi500_alpha.fetch_csi500", "probe_bs"],
-            cwd=project_root(), timeout=30, check=False,
+            cwd=project_root(), env=probe_env, timeout=30, check=False,
         )
         if res.returncode != 0:
             print("   [WARN] BaoStock PIT probe failed; CSIndex fallback available (--members-source csindex).", flush=True)

@@ -1,0 +1,66 @@
+[project]
+name = "csi500-alpha"
+universe = "csi500"
+index_code = "000905"
+total_return_code = "H00905"
+incremental_root = "D:/QuantProjects/dfl-csi-alpha/data/incremental"
+
+[dates]
+warmup_start = "2014-06-01"
+factor_start = "2015-01-01"
+eval_start = "2017-01-01"
+dev_end = "2025-12-31"
+# Phase 1 strictly forbids reading 2026+ data.
+
+[factors]
+list = [
+  "ROE",
+  "NP_YOY",
+  "CFO_YIELD",
+  "EP_TTM",
+  "BP_MRQ",
+  "MOM_120_SKIP20",
+  "HIGH_52W_PROX",
+  "OVERNIGHT_RET_20",
+  "INTRADAY_REV_20",
+  "CORR_PV_10",
+]
+winsorize_sigma = 3.0
+horizon_days = 5
+
+[portfolio]
+active_limit = 0.015
+single_stock_cap = 0.04
+proj_gamma = 0.005
+train_dykstra_steps = 12
+inference_dykstra_steps = 30
+dykstra_eps = 1e-7
+rebalance_sessions = 5
+fee_bps_list = [10, 20]
+initial_cash = "1000000"
+cash_reserve = 0.003
+
+[models]
+evaluated_strategies = [
+  "S0_EqualWeight",
+  "S1_RollingRidge",
+  "S2_WhiteboxDFL",
+]
+num_trials_n = 3
+rolling_window_weeks = 260
+min_train_weeks = 52
+ridge_l2 = 1.0
+dfl_refit_weeks = 12
+dfl_epochs = 20
+dfl_lr = 0.05
+dfl_prior_lambda = 2.0
+dfl_train_fee = 0.0015
+dfl_aux_ic_weight = 0.05
+dfl_chunk_weeks = 26
+dfl_seed = 42
+torch_threads = 4
+
+[stats]
+newey_west_lag = 4
+cscv_blocks = 16
+cscv_max_splits = 500

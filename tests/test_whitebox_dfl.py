@@ -104,7 +104,7 @@ class TestWhiteboxDFL(unittest.TestCase):
             pen = 2.0 * ((th - prior) ** 2).sum()
             pen.backward()
             opt.step()
-        self.assertLess(float(((net.factor_weights() - prior) ** 2).sum()), init_dist)
+        self.assertLess(float(((net.factor_weights().detach() - prior) ** 2).sum()), init_dist)
 
     def test_pit_quarterly_and_industry_alignment(self) -> None:
         signals = pd.DataFrame({
@@ -150,12 +150,12 @@ class TestWhiteboxDFL(unittest.TestCase):
         })
         nav = run_backtest("test", preds, bars, pd.DatetimeIndex(days), fee_bps=0, initial_cash=100_000.0)
         # 100,000 * (1 - 0.003) * 0.5 = 49,850 -> 2,400 raw shares = 48,000 RMB invested at raw=20 / hfq=40
-        # Day 1: 2-for-1 split -> 4,800 raw shares @ raw=10 = 48,000 RMB (0 spurious trades!)
-        # Day 2: +10% return (hfq 40 -> 44) -> 48,000 * 1.10 + 52,000 cash = 104,800.0 exact!
+        # Day 1: 2-for-1 split -> 4,800 raw shares @ raw=10 (48,000 RMB), desired=4,985 -> buys 100 more shares (1,000 RMB) -> 49,000 RMB invested
+        # Day 2: +10% return (hfq 40 -> 44) -> 49,000 * 1.10 + 51,000 cash = 104,900.0 exact!
         self.assertAlmostEqual(float(nav.loc[0, "equity"]), 100_000.0, places=4)
         self.assertAlmostEqual(float(nav.loc[1, "equity"]), 100_000.0, places=4)
-        self.assertAlmostEqual(float(nav.loc[1, "gross_traded"]), 0.0, places=4)
-        self.assertAlmostEqual(float(nav.loc[2, "equity"]), 104_800.0, places=4)
+        self.assertAlmostEqual(float(nav.loc[1, "gross_traded"]), 1000.0, places=4)
+        self.assertAlmostEqual(float(nav.loc[2, "equity"]), 104_900.0, places=4)
 
     def test_stats_n3_valid(self) -> None:
         rng = np.random.default_rng(9)

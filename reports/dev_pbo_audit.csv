@@ -1,0 +1,5 @@
+﻿fee_bps,benchmark,num_strategies_N,cscv_blocks,splits_evaluated,pbo,median_oos_rank_pct
+10,H00905,3,16,500,0.746,0.5
+10,FloatMV,3,16,500,0.7,0.5
+20,H00905,3,16,500,0.506,0.5
+20,FloatMV,3,16,500,0.482,0.75

@@ -101,10 +101,11 @@ def plot_yearly_excess(rep_dir: Path, out_dir: Path) -> Path:
     ax.axhline(0.0, color="#444444", linewidth=0.9)
     ax.set_xticks(x)
     ax.set_xticklabels(years)
+    ax.set_ylim(-7.0, 17.5)
     ax.set_ylabel("年度超额收益 vs 同引擎 B0 锚 (百分点 %)")
     ax.set_title("2017–2025 分年度选股超额对比（A 股真实分段成本，剔除基准漂移）", fontsize=11.3, fontweight="bold")
     ax.grid(True, axis="y", linestyle="--", alpha=0.35)
-    ax.legend(loc="upper right", ncol=2, fontsize=8.6, frameon=True)
+    ax.legend(loc="upper center", ncol=4, fontsize=8.3, frameon=True)
     fig.tight_layout()
 
     target = out_dir / "yearly_excess_comparison.png"

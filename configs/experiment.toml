@@ -10,13 +10,22 @@ warmup_start = "2014-06-01"
 factor_start = "2015-01-01"
 eval_start = "2017-01-01"
 dev_end = "2025-12-31"
-# Phase 1 strictly forbids reading 2026+ data.
+# Phase 1 / v2 audit strictly forbids reading 2026+ data until frozen.
 
 [factors]
 list = [
   "ROE",
   "NP_YOY",
   "CFO_YIELD",
+  "EP_TTM",
+  "BP_MRQ",
+  "MOM_120_SKIP20",
+  "HIGH_52W_PROX",
+  "OVERNIGHT_RET_20",
+  "INTRADAY_REV_20",
+  "CORR_PV_10",
+]
+pure_pit_7_list = [
   "EP_TTM",
   "BP_MRQ",
   "MOM_120_SKIP20",
@@ -36,13 +45,18 @@ train_dykstra_steps = 12
 inference_dykstra_steps = 30
 dykstra_eps = 1e-7
 rebalance_sessions = 5
-fee_bps_list = [10, 20]
+low_turn_ema_alpha = 0.65
+fee_modes = ["fixed_0bp", "fixed_10bp", "fixed_20bp", "ashare_realistic"]
 initial_cash = "1000000"
+capacity_cash_list = [1000000, 10000000, 100000000]
+max_prev_amount_participation = 0.05
 cash_reserve = 0.003
 
 [models]
 evaluated_strategies = [
+  "B0_FloatMV_Anchor",
   "S0_EqualWeight",
+  "S0_LowTurn_Band",
   "S1_RollingRidge",
   "S2_WhiteboxDFL",
 ]
@@ -58,9 +72,13 @@ dfl_train_fee = 0.0015
 dfl_aux_ic_weight = 0.05
 dfl_chunk_weeks = 26
 dfl_seed = 42
+dfl_stability_seeds = [42, 43, 44, 45, 46]
 torch_threads = 4
 
 [stats]
 newey_west_lag = 4
 cscv_blocks = 16
 cscv_max_splits = 500
+dsr_conservative_n = 10
+bootstrap_reps = 2000
+bootstrap_block_days = 10

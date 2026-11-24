@@ -25,6 +25,16 @@ FACTORS = [
     "CORR_PV_10",
 ]
 
+FACTORS_PURE_PIT_7 = [
+    "EP_TTM",
+    "BP_MRQ",
+    "MOM_120_SKIP20",
+    "HIGH_52W_PROX",
+    "OVERNIGHT_RET_20",
+    "INTRADAY_REV_20",
+    "CORR_PV_10",
+]
+
 
 def _to_ns(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series).astype("datetime64[ns]")
@@ -80,12 +90,17 @@ def align_quarterly_pit(signals_df: pd.DataFrame, quarterly_df: pd.DataFrame) ->
         statutory = _statutory_avail_date(right["report_date"])
         timely = lag_days.between(0, 150)
         right["avail_date"] = _to_ns(right["pub_date"].where(timely, statutory))
+        right["quarterly_fallback_used"] = (~timely).astype(bool)
         right = right.dropna(subset=["avail_date"]).sort_values(["avail_date", "report_date", "code"], kind="mergesort")
     else:
         right["avail_date"] = right["pub_date"]
+        right["quarterly_fallback_used"] = False
         right = right.dropna(subset=["avail_date"]).sort_values(["avail_date", "code"], kind="mergesort")
 
-    keep_cols = [c for c in ["code", "avail_date", "pub_date", "report_date", "roe", "np_yoy", "cfo_per_share"] if c in right.columns]
+    keep_cols = [
+        c for c in ["code", "avail_date", "pub_date", "report_date", "quarterly_fallback_used", "roe", "np_yoy", "cfo_per_share"]
+        if c in right.columns
+    ]
     merged = pd.merge_asof(
         left,
         right[keep_cols],
@@ -98,11 +113,12 @@ def align_quarterly_pit(signals_df: pd.DataFrame, quarterly_df: pd.DataFrame) ->
     bad = merged["avail_date"].notna() & (merged["avail_date"] > merged["signal_date"])
     if bad.any():
         raise ValueError(f"Point-in-time violation: {int(bad.sum())} rows have avail_date > signal_date")
+    merged["quarterly_fallback_used"] = merged["quarterly_fallback_used"].eq(True)
     return merged.sort_values("_orig_order").drop(columns=["_orig_order"]).reset_index(drop=True)
 
 
 def align_industry_pit(signals_df: pd.DataFrame, industry_df: pd.DataFrame) -> pd.DataFrame:
-    """Align Shenwan Level-1 industry classification by start_date <= signal_date."""
+    """Strictly align Shenwan Level-1 industry by start_date <= signal_date (no future backfill)."""
     left = signals_df.copy()
     left["_orig_order"] = np.arange(len(left))
     left["signal_date"] = _to_ns(left["signal_date"])
@@ -124,8 +140,7 @@ def align_industry_pit(signals_df: pd.DataFrame, industry_df: pd.DataFrame) -> p
         bad = merged["start_date"].notna() & (merged["start_date"] > merged["signal_date"])
         if bad.any():
             raise ValueError(f"Industry PIT violation: {int(bad.sum())} rows have start_date > signal_date")
-        earliest_map = right.drop_duplicates(subset=["code"], keep="first").set_index("code")["industry"].to_dict()
-        merged["industry"] = merged["industry"].fillna(merged["code"].map(earliest_map)).fillna("Other").astype(str)
+        merged["industry"] = merged["industry"].fillna("Other").astype(str)
         merged = merged.drop(columns=["start_date"])
     else:
         ind_map = right.drop_duplicates(subset=["code"], keep="last").set_index("code")["industry"].to_dict()
@@ -367,14 +382,22 @@ def load_and_build_csi500_dataset(cfg: dict[str, Any], raw_dir: Path) -> tuple[p
         if "tradestatus" in bars.columns
         else True
     )
-    bars["bar_ok"] = (
-        bars["raw_open"].gt(0) & bars["raw_close"].gt(0)
-        & bars["hfq_open"].gt(0) & bars["hfq_close"].gt(0)
+    bars["open_tradable"] = (
+        bars["raw_open"].gt(0)
+        & bars["hfq_open"].gt(0)
+        & tradestatus_ok
+    )
+    bars["close_ok"] = (
+        bars["open_tradable"]
+        & bars["raw_close"].gt(0)
+        & bars["hfq_close"].gt(0)
         & bars["hfq_high"].ge(bars[["hfq_open", "hfq_close", "hfq_low"]].max(axis=1))
         & bars["hfq_low"].le(bars[["hfq_open", "hfq_close"]].min(axis=1))
         & bars["volume"].gt(0)
-        & tradestatus_ok
     )
+    bars["bar_ok"] = bars["close_ok"]
+    bars["prev_amount"] = bars.groupby("code")["amount"].shift(1)
+    open_vs_close_diff = int((bars["open_tradable"] != bars["close_ok"]).sum())
 
     # Load shared incremental data (industry & quarterly reports)
     ind_df = pd.read_parquet(inc_root / "industry_map.parquet")
@@ -454,16 +477,17 @@ def load_and_build_csi500_dataset(cfg: dict[str, Any], raw_dir: Path) -> tuple[p
     frame = align_industry_pit(frame, ind_df)
     frame = neutralize_cross_section(frame, FACTORS, winsor_sigma=3.0)
 
-    exit_mapper = pd.Series(trading_days, index=trading_days).shift(-horizon)
-    frame["exit_date"] = frame["entry_date"].map(exit_mapper)
+    next_exec = pd.Series(schedule["execution_date"].shift(-1).to_numpy(), index=schedule["execution_date"])
+    fallback_exit = pd.Series(trading_days, index=trading_days).shift(-horizon)
+    frame["exit_date"] = frame["entry_date"].map(next_exec).fillna(frame["entry_date"].map(fallback_exit))
 
-    open_bars = bars[["date", "code", "hfq_open", "bar_ok"]].copy()
+    open_bars = bars[["date", "code", "hfq_open", "open_tradable"]].copy()
     frame = frame.merge(
-        open_bars.rename(columns={"date": "entry_date", "hfq_open": "entry_open", "bar_ok": "entry_ok"}),
+        open_bars.rename(columns={"date": "entry_date", "hfq_open": "entry_open", "open_tradable": "entry_ok"}),
         on=["entry_date", "code"], how="left", validate="many_to_one",
     )
     frame = frame.merge(
-        open_bars.rename(columns={"date": "exit_date", "hfq_open": "exit_open", "bar_ok": "exit_ok"}),
+        open_bars.rename(columns={"date": "exit_date", "hfq_open": "exit_open", "open_tradable": "exit_ok"}),
         on=["exit_date", "code"], how="left", validate="many_to_one",
     )
 
@@ -477,7 +501,14 @@ def load_and_build_csi500_dataset(cfg: dict[str, Any], raw_dir: Path) -> tuple[p
     frame["stock_return_5d"] = (frame["exit_open"] / frame["entry_open"] - 1.0).where(valid_label)
     frame["h00905_return_5d"] = (frame["exit_date"].map(h00905) / frame["entry_date"].map(h00905) - 1.0).where(frame["exit_date"].notna())
 
-    raw_target = ((frame["stock_return_5d"] - frame["BETA_120"] * frame["h00905_return_5d"]) / frame["VOL_20"].clip(lower=0.01)).replace([np.inf, -np.inf], np.nan)
+    w_valid = frame["weight_float_mv"].where(frame["stock_return_5d"].notna(), 0.0)
+    w_sum = w_valid.groupby(frame["signal_date"]).transform("sum")
+    anchor_ret_hold = (w_valid * frame["stock_return_5d"].fillna(0.0)).groupby(frame["signal_date"]).transform("sum") / w_sum.where(w_sum > 0)
+    frame["anchor_return_hold"] = anchor_ret_hold.fillna(frame["h00905_return_5d"])
+
+    raw_target = (
+        (frame["stock_return_5d"] - frame["BETA_120"] * frame["anchor_return_hold"]) / frame["VOL_20"].clip(lower=0.01)
+    ).replace([np.inf, -np.inf], np.nan)
     frame["risk_adjusted_target"] = np.nan
     for _, idx in frame.groupby("signal_date", sort=False).groups.items():
         y = raw_target.loc[idx].dropna()
@@ -491,11 +522,19 @@ def load_and_build_csi500_dataset(cfg: dict[str, Any], raw_dir: Path) -> tuple[p
         if sd2 > 1e-12:
             frame.loc[y.index, "risk_adjusted_target"] = (trimmed - trimmed.mean()) / sd2
 
+    eval_slice = frame.loc[frame["signal_date"] >= pd.Timestamp("2017-01-01")]
+    has_rep = eval_slice["report_date"].notna()
+    q_fallback_rate = (
+        float(eval_slice.loc[has_rep, "quarterly_fallback_used"].mean())
+        if has_rep.any()
+        else 1.0
+    )
+
     audit_rows = []
     for f in FACTORS:
         raw_col = f"raw_{f}"
         cov_all = float(frame[raw_col].notna().mean())
-        cov_eval = float(frame.loc[frame["signal_date"] >= pd.Timestamp("2017-01-01"), raw_col].notna().mean())
+        cov_eval = float(eval_slice[raw_col].notna().mean())
         audit_rows.append({"factor": f, "coverage_2015_2025": cov_all, "coverage_2017_2025": cov_eval})
     audit_df = pd.DataFrame(audit_rows)
 
@@ -503,7 +542,10 @@ def load_and_build_csi500_dataset(cfg: dict[str, Any], raw_dir: Path) -> tuple[p
     med_corr = np.nanmedian(np.stack(corr_mats, axis=0), axis=0)
     np.fill_diagonal(med_corr, 0.0)
     audit_df["max_median_abs_spearman_vs_others"] = med_corr.max(axis=1)
-    audit_df["pit_quarterly_passed"] = True
+    audit_df["quarterly_fallback_rate_2017_2025"] = q_fallback_rate
+    audit_df["pit_quarterly_strict"] = bool(q_fallback_rate < 0.01)
+    audit_df["pit_industry_strict"] = True
+    audit_df["open_vs_close_diff_rows"] = open_vs_close_diff
     audit_df["pit_members"] = pit_members
 
     benchmarks = compute_benchmarks(frame, bars, h00905, schedule, trading_days)

@@ -1,4 +1,4 @@
-"""Step 5: Generate high-resolution defense & README figures in reports/figures/."""
+"""Step 5: Generate high-resolution v2 defense & README figures in reports/figures/."""
 
 from __future__ import annotations
 
@@ -25,13 +25,15 @@ plt.rcParams["figure.dpi"] = 160
 
 COLORS = {
     "S0_EqualWeight": "#4C72B0",
+    "S0_LowTurn_Band": "#2E7D32",
     "S1_RollingRidge": "#DD8452",
     "S2_WhiteboxDFL": "#C44E52",
 }
 LABELS = {
-    "S0_EqualWeight": "S0 等权基准 (1/10)",
+    "S0_EqualWeight": "S0 十因子等权 (1/10)",
+    "S0_LowTurn_Band": "S0_LowTurn 低换手平滑等权 (无参数)",
     "S1_RollingRidge": "S1 两阶段滚动 Ridge",
-    "S2_WhiteboxDFL": "S2 10参数白盒 DFL (本文)",
+    "S2_WhiteboxDFL": "S2 10参数白盒 DFL",
 }
 
 
@@ -39,24 +41,28 @@ def plot_excess_curves(bt_dir: Path, out_dir: Path) -> Path:
     daily = pd.read_parquet(bt_dir / "daily_active_returns.parquet")
     daily["date"] = pd.to_datetime(daily["date"])
 
-    fig, axes = plt.subplots(1, 2, figsize=(13.5, 4.8), sharey=True)
-    for ax, fee in zip(axes, [10, 20]):
-        sub = daily.loc[daily["fee_bps"] == fee]
-        for strat in ["S0_EqualWeight", "S1_RollingRidge", "S2_WhiteboxDFL"]:
+    fig, axes = plt.subplots(1, 2, figsize=(13.8, 4.9), sharey=True)
+    panels = [
+        ("ashare_realistic", "A股真实分段成本：相对同引擎 B0 锚累计超额"),
+        ("fixed_20bp", "保守基准 (20 bp)：相对同引擎 B0 锚累计超额"),
+    ]
+    for ax, (fm, title) in zip(axes, panels):
+        sub = daily.loc[daily["fee_mode"] == fm]
+        for strat in ["S0_EqualWeight", "S0_LowTurn_Band", "S1_RollingRidge", "S2_WhiteboxDFL"]:
             g = sub.loc[sub["strategy"] == strat].sort_values("date")
-            rel_nav = ((1.0 + g["port_ret"]) / (1.0 + g["h00905_ret"])).cumprod()
-            lw = 2.4 if strat == "S2_WhiteboxDFL" else 1.6
-            ls = "-" if strat != "S1_RollingRidge" else "--"
+            rel_nav = ((1.0 + g["port_ret"]) / (1.0 + g["floatmv_ret"])).cumprod()
+            lw = 2.3 if strat in ("S2_WhiteboxDFL", "S0_LowTurn_Band") else 1.5
+            ls = "--" if strat == "S1_RollingRidge" else "-"
             ax.plot(g["date"], (rel_nav - 1.0) * 100.0, label=LABELS[strat], color=COLORS[strat], linewidth=lw, linestyle=ls)
 
         ax.axhline(0.0, color="#666666", linewidth=0.8, linestyle=":")
         ax.axvspan(pd.Timestamp("2023-01-01"), g["date"].max(), color="#F0F4F8", alpha=0.8, label="2023–2025 量化收紧期")
-        ax.set_title(f"单边费率 {fee} bp：相对中证500全收益 (H00905) 累计超额净值", fontsize=11, fontweight="bold")
-        ax.set_ylabel("几何累计超额收益 (%)" if fee == 10 else "")
+        ax.set_title(title, fontsize=10.8, fontweight="bold")
+        ax.set_ylabel("相对同引擎 B0 锚几何累计超额 (%)" if fm == "ashare_realistic" else "")
         ax.xaxis.set_major_locator(mdates.YearLocator(2))
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
         ax.grid(True, linestyle="--", alpha=0.35)
-        ax.legend(loc="upper left", fontsize=8.8, frameon=True)
+        ax.legend(loc="upper left", fontsize=8.3, frameon=True)
 
     fig.tight_layout()
     target = out_dir / "nav_and_excess_10bp_20bp.png"
@@ -68,16 +74,17 @@ def plot_excess_curves(bt_dir: Path, out_dir: Path) -> Path:
 def plot_yearly_excess(rep_dir: Path, out_dir: Path) -> Path:
     yearly = pd.read_csv(rep_dir / "dev_yearly.csv")
     years = [str(y) for y in range(2017, 2026)]
-    sub = yearly.loc[(yearly["fee_bps"] == 10) & (yearly["period"].isin(years))].copy()
+    sub = yearly.loc[(yearly["fee_mode"] == "ashare_realistic") & (yearly["period"].isin(years))].copy()
 
     x = np.arange(len(years))
-    width = 0.26
-    fig, ax = plt.subplots(figsize=(12.0, 4.6))
+    width = 0.20
+    strats = ["S0_EqualWeight", "S0_LowTurn_Band", "S1_RollingRidge", "S2_WhiteboxDFL"]
+    fig, ax = plt.subplots(figsize=(12.6, 4.7))
 
-    for idx, strat in enumerate(["S0_EqualWeight", "S1_RollingRidge", "S2_WhiteboxDFL"]):
+    for idx, strat in enumerate(strats):
         s_df = sub.loc[sub["strategy"] == strat].set_index("period").reindex(years)
-        vals = s_df["excess_h00905_pp"].to_numpy() * 100.0
-        bars = ax.bar(x + (idx - 1) * width, vals, width=width, label=LABELS[strat], color=COLORS[strat], alpha=0.9)
+        vals = s_df["excess_floatmv_pp"].to_numpy() * 100.0
+        bars = ax.bar(x + (idx - 1.5) * width, vals, width=width, label=LABELS[strat], color=COLORS[strat], alpha=0.92)
         if strat == "S2_WhiteboxDFL":
             for b, v in zip(bars, vals):
                 ax.text(
@@ -86,7 +93,7 @@ def plot_yearly_excess(rep_dir: Path, out_dir: Path) -> Path:
                     f"{v:+.1f}%",
                     ha="center",
                     va="bottom" if v >= 0 else "top",
-                    fontsize=7.8,
+                    fontsize=7.3,
                     color="#8B1A1A",
                     fontweight="bold",
                 )
@@ -94,10 +101,10 @@ def plot_yearly_excess(rep_dir: Path, out_dir: Path) -> Path:
     ax.axhline(0.0, color="#444444", linewidth=0.9)
     ax.set_xticks(x)
     ax.set_xticklabels(years)
-    ax.set_ylabel("年度超额收益 vs H00905 (百分点 %)")
-    ax.set_title("2017–2025 分年度超额收益对比（单边 10 bp）：白盒 DFL 连续 9 年正超额", fontsize=11.5, fontweight="bold")
+    ax.set_ylabel("年度超额收益 vs 同引擎 B0 锚 (百分点 %)")
+    ax.set_title("2017–2025 分年度选股超额对比（A 股真实分段成本，剔除基准漂移）", fontsize=11.3, fontweight="bold")
     ax.grid(True, axis="y", linestyle="--", alpha=0.35)
-    ax.legend(loc="upper right", fontsize=9.2)
+    ax.legend(loc="upper right", ncol=2, fontsize=8.6, frameon=True)
     fig.tight_layout()
 
     target = out_dir / "yearly_excess_comparison.png"
@@ -163,7 +170,7 @@ def main() -> None:
     p1 = plot_excess_curves(bt_dir, out_dir)
     p2 = plot_yearly_excess(rep_dir, out_dir)
     p3 = plot_factor_weights(rep_dir, out_dir)
-    print(f"[plot] Saved 3 figures:\n  - {p1}\n  - {p2}\n  - {p3}")
+    print(f"[plot] Saved 3 v2 figures:\n  - {p1}\n  - {p2}\n  - {p3}")
 
 
 if __name__ == "__main__":

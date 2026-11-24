@@ -1,5 +1,9 @@
-﻿fee_bps,benchmark,num_strategies_N,cscv_blocks,splits_evaluated,pbo,median_oos_rank_pct
-10,H00905,3,16,500,0.746,0.5
-10,FloatMV,3,16,500,0.7,0.5
-20,H00905,3,16,500,0.506,0.5
-20,FloatMV,3,16,500,0.482,0.75
+﻿fee_mode,benchmark,num_strategies,cscv_blocks,splits_evaluated,pbo,median_oos_rank_pct
+fixed_0bp,H00905,4,16,500,0.182,0.8
+fixed_0bp,B0_FloatMV,4,16,500,0.38,0.6
+fixed_10bp,H00905,4,16,500,0.062,0.8
+fixed_10bp,B0_FloatMV,4,16,500,0.514,0.4
+fixed_20bp,H00905,4,16,500,0.052,0.8
+fixed_20bp,B0_FloatMV,4,16,500,0.17,0.6
+ashare_realistic,H00905,4,16,500,0.082,0.8
+ashare_realistic,B0_FloatMV,4,16,500,0.378,0.6

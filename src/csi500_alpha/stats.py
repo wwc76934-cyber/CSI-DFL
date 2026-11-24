@@ -1,4 +1,4 @@
-"""Statistical audit helpers: Newey-West t-stat, PSR/DSR (N=3), and CSCV PBO."""
+"""Statistical audit helpers: Newey-West t-stat, paired circular block bootstrap, PSR/DSR (N=3 & N=10), CSCV PBO."""
 
 from __future__ import annotations
 
@@ -40,6 +40,97 @@ def annualized_ir_from_returns(active_returns: np.ndarray, periods_per_year: int
     return float(math.sqrt(periods_per_year) * x.mean() / sd) if sd > 0 else np.nan
 
 
+def paired_return_test(
+    ret_a: np.ndarray,
+    ret_b: np.ndarray,
+    bench_ret: np.ndarray | None = None,
+    lag: int = 4,
+    n_boot: int = 2000,
+    block_size: int = 10,
+    periods_per_year: int = 252,
+    seed: int = 42,
+) -> dict[str, float]:
+    """Paired daily return difference test (A - B) with Newey-West t/p and circular block-bootstrap 95% CIs."""
+    a = np.asarray(ret_a, dtype=np.float64)
+    b = np.asarray(ret_b, dtype=np.float64)
+    if bench_ret is not None:
+        bm = np.asarray(bench_ret, dtype=np.float64)
+        mask = np.isfinite(a) & np.isfinite(b) & np.isfinite(bm)
+        a, b, bm = a[mask], b[mask], bm[mask]
+    else:
+        mask = np.isfinite(a) & np.isfinite(b)
+        a, b = a[mask], b[mask]
+        bm = None
+
+    diff = a - b
+    n = len(diff)
+    if n < 20:
+        return {
+            "days": n,
+            "mean_daily_bps": np.nan,
+            "ann_diff": np.nan,
+            "te_diff": np.nan,
+            "ir_diff": np.nan,
+            "nw_tstat": np.nan,
+            "nw_pval": np.nan,
+            "ann_diff_ci_lo": np.nan,
+            "ann_diff_ci_hi": np.nan,
+            "ir_gap": np.nan,
+            "ir_gap_ci_lo": np.nan,
+            "ir_gap_ci_hi": np.nan,
+        }
+
+    mean_d, t_nw, p_nw = newey_west_t_stat(diff, lag=lag)
+    te_diff = float(diff.std(ddof=1) * math.sqrt(periods_per_year))
+    ir_diff = annualized_ir_from_returns(diff, periods_per_year)
+
+    if bm is not None:
+        act_a = a - bm
+        act_b = b - bm
+        ir_gap = annualized_ir_from_returns(act_a, periods_per_year) - annualized_ir_from_returns(act_b, periods_per_year)
+    else:
+        act_a, act_b, ir_gap = None, None, np.nan
+
+    rng = np.random.default_rng(seed)
+    blk = max(1, min(int(block_size), n // 2))
+    n_blocks = int(math.ceil(n / blk))
+    starts = rng.integers(0, n, size=(n_boot, n_blocks))
+    offsets = np.arange(blk)[None, None, :]
+    idx = (starts[:, :, None] + offsets).reshape(n_boot, -1)[:, :n] % n
+
+    boot_diff = diff[idx]
+    boot_ann = boot_diff.mean(axis=1) * periods_per_year
+    ann_lo, ann_hi = np.percentile(boot_ann, [2.5, 97.5])
+
+    if act_a is not None and act_b is not None:
+        ba = act_a[idx]
+        bb = act_b[idx]
+        sd_a = ba.std(axis=1, ddof=1)
+        sd_b = bb.std(axis=1, ddof=1)
+        ir_a = np.where(sd_a > 1e-12, math.sqrt(periods_per_year) * ba.mean(axis=1) / sd_a, np.nan)
+        ir_b = np.where(sd_b > 1e-12, math.sqrt(periods_per_year) * bb.mean(axis=1) / sd_b, np.nan)
+        boot_ir_gap = ir_a - ir_b
+        valid_gap = boot_ir_gap[np.isfinite(boot_ir_gap)]
+        ir_lo, ir_hi = np.percentile(valid_gap, [2.5, 97.5]) if len(valid_gap) else (np.nan, np.nan)
+    else:
+        ir_lo, ir_hi = np.nan, np.nan
+
+    return {
+        "days": int(n),
+        "mean_daily_bps": float(mean_d * 10000.0),
+        "ann_diff": float(mean_d * periods_per_year),
+        "te_diff": te_diff,
+        "ir_diff": float(ir_diff),
+        "nw_tstat": float(t_nw),
+        "nw_pval": float(p_nw),
+        "ann_diff_ci_lo": float(ann_lo),
+        "ann_diff_ci_hi": float(ann_hi),
+        "ir_gap": float(ir_gap),
+        "ir_gap_ci_lo": float(ir_lo),
+        "ir_gap_ci_hi": float(ir_hi),
+    }
+
+
 def probabilistic_sharpe_ratio(
     active_returns: np.ndarray,
     benchmark_sr: float = 0.0,
@@ -66,20 +157,22 @@ def deflated_sharpe_ratio(
     active_returns_matrix: np.ndarray,
     target_col: int,
     periods_per_year: int = 252,
+    n_trials_override: int | None = None,
 ) -> tuple[float, float]:
     mat = np.asarray(active_returns_matrix, dtype=np.float64)
-    _, n_trials = mat.shape
+    _, n_cols = mat.shape
+    n_trials = int(n_cols if n_trials_override is None else max(n_cols, n_trials_override))
     if n_trials <= 1:
         _, psr, _, _ = probabilistic_sharpe_ratio(mat[:, target_col], 0.0, periods_per_year)
         return 0.0, psr
 
     srs = []
-    for j in range(n_trials):
+    for j in range(n_cols):
         col = mat[:, j]
         col = col[np.isfinite(col)]
         sd = col.std(ddof=1)
         srs.append(col.mean() / sd if sd > 0 else 0.0)
-    sr_std = math.sqrt(max(float(np.var(srs, ddof=1)), 1e-12))
+    sr_std = math.sqrt(max(float(np.var(srs, ddof=1)), 1e-12)) if len(srs) > 1 else 0.0
     z1 = norm.ppf(1.0 - 1.0 / n_trials)
     z2 = norm.ppf(1.0 - 1.0 / (n_trials * math.e))
     sr0_ann = sr_std * ((1.0 - EULER_GAMMA) * z1 + EULER_GAMMA * z2) * math.sqrt(periods_per_year)

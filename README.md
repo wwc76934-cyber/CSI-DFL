@@ -1,86 +1,86 @@
-# CSI-DFL：基于 10 参数白盒决策聚焦学习（Whitebox DFL）的中证 500 指数增强研究
+# CSI-DFL：中证 500 指数增强中 10 参数白盒 DFL、两阶段回归与低换手规则的严谨实证比较
 
-简洁、完全白盒、严格防未来函数与防幸存者偏差的 **中证 500（`000905` / 全收益基准 `H00905`）指数增强** 实证框架（`2014–2025`）。
-
----
-
-## 一、研究核心思想
-
-传统量化选股多采用 **“两阶段法（Predict-then-Optimize）”**：第一阶段用回归或机器学习最大化个股未来收益预测相关性，第二阶段再送入组合优化器满足风控约束。然而两阶段目标割裂会导致模型**盲目重仓短周期高换手量价信号**，在真实交易成本与行业/市值中性约束下严重损耗净值。
-
-本项目提出并验证了一个**零黑盒、仅含 10 个可学习参数的白盒端到端决策聚焦学习（Whitebox Decision-Focused Learning, DFL）模型**：
-1. **10 个经济学先验白盒因子**：覆盖质量成长（`ROE`、`NP_YOY`、`CFO_YIELD`）、传统估值（`EP_TTM`、`BP_MRQ`）、中期趋势（`MOM_120_SKIP20`、`HIGH_52W_PROX`）与行为量价（`OVERNIGHT_RET_20`、`INTRADAY_REV_20`、`CORR_PV_10`），每周截面严格对 **申万一级行业哑变量 + 对数流通市值** 做双 OLS 中性化。
-2. **可微 Dykstra 风控投影层**：在纯 PyTorch 中展开交替投影算子，强制满足仅做多满仓、个股上限 `4.0%`、个股主动偏离 `±1.5%`、申万一级行业中性、Beta 中性与对数市值中性。
-3. **直接优化扣费净 IR + 等权先验锚定**：10 个非负归一权重 $\theta = \text{softmax}(\text{logits})$ 直接最大化组合扣费净信息比率（训练费率 `15 bp`），并引入 $\lambda_{\text{prior}} \|\theta - 0.10\|_2^2$ 正则项防止相对 `1/N` 等权退化。
+> **项目定位**：面向学术研究与教学答辩、方法严谨且结论诚实的中证 500（`000905` / 全收益 `H00905`）指数增强研究原型（开发评价期 `2017–2025`，`2026+` 保留期严格隔离未读取）。
 
 ---
 
-## 二、核心实证结果（2017–2025 严格周度 PIT 样本外滚动）
+## 一、核心研究发现（诚实、可复现、经配对检验核实）
 
-严格锁定 [事前研究宪章 `docs/PRE_ANALYSIS_PLAN.md`](docs/PRE_ANALYSIS_PLAN.md)，在运行任何回测前固定全部参数，仅评估精确 $N = 3$ 个递进模型（未读取 `2026+` 保留期数据）：
+在严格同引擎、同资金、同撮合规则与真实 A 股交易成本框架下，对比 5 组递进策略（`B0_FloatMV_Anchor` 纯流通市值锚、`S0_EqualWeight` 10 因子等权、`S0_LowTurn_Band` 零参数权重平滑低换手等权、`S1_RollingRidge` 两阶段滚动 Ridge、`S2_WhiteboxDFL` 10 参数白盒端到端 DFL），我们得到**四条经统计配对检验支持的核心结论**：
 
-| 单边费率 | 策略 | 累计净收益 | vs H00905 超额 | 跟踪误差 TE | IR (H00905) | NW t-stat ($p$) | DSR ($N=3$) | 周双边换手 |
-|---:|---|---:|---:|---:|---:|---:|---:|---:|
-| **10 bp** | `S0_EqualWeight` | +99.32% | +63.63% | 4.01% | +1.032 | +2.76 (0.0057) | 98.06% | 31.10% |
-| **10 bp** | `S1_RollingRidge` | +63.99% | +28.29% | 4.50% | +0.400 | +1.17 (0.2428) | 58.96% | 53.57% |
-| **10 bp** | **`S2_WhiteboxDFL`** | **+104.27%** | **+68.58%** | **4.08%** | **+1.079** | **+2.93 (0.0034)** | **98.61%** | **27.85%** |
-| **20 bp** | `S0_EqualWeight` | +74.83% | +39.13% | 4.10% | +0.635 | +1.72 (0.0863) | 71.99% | 30.42% |
-| **20 bp** | `S1_RollingRidge` | +30.40% | -5.29% | 4.78% | -0.188 | -0.55 (0.5837) | 3.31% | 51.73% |
-| **20 bp** | **`S2_WhiteboxDFL`** | **+82.39%** | **+46.69%** | **4.13%** | **+0.748** | **+2.05 (0.0401)** | **81.95%** | **27.33%** |
+1. **端到端 DFL 显著击败传统两阶段 Ridge（H2 强成立）**：`S1_RollingRidge` 忽略交易成本，将 `47.8%` 权重压在高换手短周期量价因子上，推高周双边换手至 `51.6%`；`S2_WhiteboxDFL` 在可微 Dykstra 风控投影层后直接优化含真实全组合漂移换手惩罚的净 IR，将换手降至 `26.6%`，在配对日度净收益检验中**年化领先 Ridge `+3.34%`（`ashare_realistic`, $t=+4.13, p<0.0001$）至 `+3.96%`（`20 bp`, $t=+4.88, p<0.0001$）**。
+2. **DFL 相对 1/N 等权与简单低换手规则的增量未达统计显著（H3 诚实证伪/中性结论）**：在全期配对检验中，`S2_WhiteboxDFL` 相对 `S0_EqualWeight` 仅多 `+0.40%/年`（$t=+0.88, p=0.3788$，不显著）；更关键的是，**零参数的简单权重平滑规则 `S0_LowTurn_Band`（$\alpha=0.65$，周换手 `17.8%`）已可显著超越普通等权（`20 bp` 下 `+1.14%/年`, $t=+2.83, p=0.0047$）并在全期追平甚至略微领先 `S2_WhiteboxDFL`（配对差 `-0.39%/年`, $p=0.4787$）**。不过在近期 `2023–2025` 量化收紧阶段，`S2_WhiteboxDFL` 凭借自适应增配 `CFO_YIELD` 与 `BP_MRQ` 取得最高区间 `IR_B0`（`+0.968` vs `S0_LowTurn +0.752`）。
+3. **剔除基准漂移与季报重述风险后，选股超额依然稳健**：相对同引擎自建锚 `B0`，`S2_WhiteboxDFL` 与 `S0_LowTurn_Band` 在 `ashare_realistic` 下年化选股超额 `+4.76%` / `+5.16%`（$p=0.005$）；在**完全剔除 3 个东财重述季报因子的 7 因子纯 PIT 消融**中，两者依然保持 `IR_B0 = +0.817` / `+0.945`。
+4. **规模容量与整手效应审计**：在 `100 万` 账户下 500 只股票的 100 股整手限制会导致 `B0` 现金占比达 `18.2%`；而在更贴合机构实盘的 **`1,000 万` 与 `1 亿` 人民币规模**（叠加前一日成交额 `5%` 参与率上限）下，现金占比降至 `0.02%–0.03%`，`S2_WhiteboxDFL` 与 `S0_LowTurn_Band` 分别维持 `IR_B0 = +0.891` 与 `+1.006`（9 年仅 `12` / `3` 笔订单触及流动性截断）。
 
-### 1. 累计超额净值曲线（10 bp & 20 bp）
-![累计超额净值曲线](reports/figures/nav_and_excess_10bp_20bp.png)
+---
 
-### 2. 2017–2025 连续 9 年正超额（10 bp 口径）
-![分年度超额对比](reports/figures/yearly_excess_comparison.png)
+## 二、核心实证汇总表（2017–2025，同引擎对照 `B0_FloatMV_Anchor`）
 
-### 3. 白盒机制：自动降权高换手量价、增配基本面现金流与估值
+| 成本口径 | 策略 | 累计净收益 | vs H00905 | vs 同引擎 B0 锚 | IR (vs B0) | 周双边换手 | 配对 vs B0 ($p$) |
+|---|---|---:|---:|---:|---:|---:|---:|
+| **A 股真实分段** *(买10/卖20→15bp)* | `B0_FloatMV_Anchor` | +35.46% | -0.24% | +0.00% | — | 1.08% | — |
+| **A 股真实分段** | `S0_EqualWeight` | +88.29% | +52.59% | +52.83% | +0.919 | 30.71% | +2.50 (`0.0123`) |
+| **A 股真实分段** | `S0_LowTurn_Band` | **+99.75%** | **+64.06%** | **+64.30%** | +1.012 | **17.81%** | +2.80 (`0.0050`) |
+| **A 股真实分段** | `S1_RollingRidge` | +47.38% | +11.68% | +11.92% | +0.307 | 51.57% | +0.83 (`0.4073`) |
+| **A 股真实分段** | `S2_WhiteboxDFL` | +94.99% | +59.30% | +59.54% | **+1.029** | 26.63% | +2.80 (`0.0051`) |
+| **保守基准 (20 bp)** | `S0_EqualWeight` | +73.98% | +38.29% | +38.94% | +0.741 | 30.37% | +2.03 (`0.0420`) |
+| **保守基准 (20 bp)** | `S0_LowTurn_Band` | **+90.04%** | **+54.35%** | **+55.00%** | **+0.909** | **17.60%** | +2.52 (`0.0117`) |
+| **保守基准 (20 bp)** | `S1_RollingRidge` | +30.13% | -5.56% | -4.91% | +0.002 | 50.66% | +0.00 (`0.9963`) |
+| **保守基准 (20 bp)** | `S2_WhiteboxDFL` | +81.63% | +45.94% | +46.60% | +0.873 | 26.31% | +2.36 (`0.0183`) |
+
+### 关键配对检验（同日净收益差 `A - B`，Newey-West + 区块自助法 95% CI）
+| 成本口径 | 配对比较 | 年化收益差 | 95% 区块自助法 CI | NW t-stat | p-value |
+|---|---|---:|---|---:|---:|
+| `ashare_realistic` | `S2_WhiteboxDFL - S1_RollingRidge` | **+3.34%** | `[+1.72%, +4.99%]` | **+4.13** | **0.0000** |
+| `ashare_realistic` | `S2_WhiteboxDFL - S0_EqualWeight` | +0.40% | `[-0.51%, +1.35%]` | +0.88 | 0.3788 |
+| `ashare_realistic` | `S2_WhiteboxDFL - S0_LowTurn_Band` | -0.39% | `[-1.46%, +0.67%]` | -0.71 | 0.4787 |
+| `ashare_realistic` | `S0_LowTurn_Band - S0_EqualWeight` | **+0.80%** | `[+0.00%, +1.61%]` | **+1.97** | **0.0488** |
+| `fixed_20bp` | `S2_WhiteboxDFL - S1_RollingRidge` | **+3.96%** | `[+2.34%, +5.68%]` | **+4.88** | **0.0000** |
+| `fixed_20bp` | `S0_LowTurn_Band - S0_EqualWeight` | **+1.14%** | `[+0.35%, +1.93%]` | **+2.83** | **0.0047** |
+
+### 1. 同引擎相对 `B0` 锚累计超额净值曲线
+![相对同引擎B0锚累计超额净值](reports/figures/nav_and_excess_10bp_20bp.png)
+
+### 2. 2017–2025 分年度选股超额对比（A 股真实成本）
+![分年度选股超额对比](reports/figures/yearly_excess_comparison.png)
+
+### 3. 白盒 10 因子权重对比与时序演化
 ![10因子权重对比与时序演化](reports/figures/factor_weights_ridge_vs_dfl.png)
 
 ---
 
-## 三、仓库目录结构
+## 三、透明的数据与方法局限披露
 
-```text
-CSI-DFL/
-├── configs/experiment.toml          # 事前锁定的全部因子、模型、风控与交易参数
-├── docs/
-│   ├── PRE_ANALYSIS_PLAN.md         # 事前研究宪章（假设、样本切分与检验协议）
-│   └── DEFENSE_GUIDE.md             # 答辩汇报逐页讲稿与高频老师提问 Q&A
-├── src/csi500_alpha/
-│   ├── fetch_csi500.py              # BaoStock 周度 PIT 成分/日线/估值采集与一致性校验
-│   ├── factors.py                   # 10 因子工程、季报与行业 PIT 对齐、双 OLS 中性化
-│   ├── projection.py                # 纯 PyTorch & NumPy 可微 Dykstra 风控投影层
-│   ├── models.py                    # S0 等权、S1 滚动 Ridge、S2 10参数白盒 DFL
-│   ├── backtest.py                  # 次日开盘撮合、整手取整、涨跌停/停牌拦截、hfq 连续净值
-│   └── stats.py                     # Newey-West t 检验、PSR/DSR (N=3)、CSCV PBO
-├── scripts/
-│   ├── 01_fetch_csi500_data.py      # 第一步：原始行情、估值与周度历史成分采集
-│   ├── 02_build_dataset.py          # 第二步：10 因子面板构建与无收益质量审计
-│   ├── 03_run_dev_experiments.py    # 第三步：三模型滚动训练预测与双费率回测
-│   ├── 04_run_stats_and_report.py   # 第四步：统计显著性检验与 DEV_REPORT.md 生成
-│   └── 05_plot_defense_figures.py   # 第五步：生成答辩与报告可视化图表
-├── tests/test_whitebox_dfl.py       # 7 项离线单元测试（投影约束、梯度、PIT、拆股连续性等）
-└── reports/                         # 完整实验审计表、DEV_REPORT.md 及可视化图表
-```
+1. **季报数据源非首次披露 PIT**：东财 `ak.stock_yjbb_em` 的“最新公告日期”已被核实为后期重述刷新日（法定截止日回退率 `99.998%`），因此我们在 `DEV_REPORT.md` 第 6 节专门提供了剔除 3 个季报因子的 **7 因子纯 PIT 消融实验**（BaoStock `peTTM`/`pbMRQ` 经核实于真实公告日更新）。
+2. **成分股覆盖与剔除**：562 期周度 PIT 成分共 `1,326` 只标的，覆盖 `1,323` 只（`99.77%`）；3 只历史并购/更名标的（`sz.001914`, `sz.001872`, `sz.302132`）因 `raw/hfq` 天数不一致被前置门禁剔除。
+3. **2026 独立盲测尚未解封**：为遵守事前锁定原则，v2 审计全部在 `2017–2025` 完成，待完全冻结后再单独运行一次 `2026` 样本外盲测。
 
 ---
 
-## 四、复现与测试指南
+## 四、仓库结构与复现
+
+```text
+CSI-DFL/
+├── configs/experiment.toml          # 事前锁定的 v2 实验参数
+├── docs/
+│   ├── PRE_ANALYSIS_PLAN.md         # v2 事前研究宪章与修订记录
+│   └── DEFENSE_GUIDE.md             # 答辩逐页讲稿与高频老师提问 Q&A（v2 诚实版）
+├── src/csi500_alpha/                # 采集、PIT因子、可微Dykstra投影、漂移换手DFL、撮合与配对统计
+├── scripts/                         # 01_fetch -> 02_build -> 03_run -> 04_stats -> 05_plot
+├── tests/test_whitebox_dfl.py       # 8 项离线单元测试（投影、梯度、严格PIT、A股分段费率、参与率、配对检验）
+└── reports/                         # DEV_REPORT.md、配对检验/容量/多随机种子/7F消融CSV及图表
+```
 
 ```powershell
-# 1. 运行全部离线单元测试（无需联网）
+# 运行全部 8 项离线单元测试
 python -B -m unittest discover -s tests -v
 
-# 2. 采集数据（需联网访问 AKShare 与 BaoStock，并在 configs/experiment.toml 配置季报与申万一级行业路径）
-python -B .\scripts\01_fetch_csi500_data.py --probe
-python -B .\scripts\01_fetch_csi500_data.py --step all
-
-# 3. 依次构建面板、运行三模型回测、输出统计审计与图表
+# 完整复现 v2 开发期实验、审计报告与图表（需先用 01_fetch 采集数据）
 python -B .\scripts\02_build_dataset.py
 python -B .\scripts\03_run_dev_experiments.py
 python -B .\scripts\04_run_stats_and_report.py
 python -B .\scripts\05_plot_defense_figures.py
 ```
 
-详细汇报讲稿与答辩问答请参阅：[docs/DEFENSE_GUIDE.md](docs/DEFENSE_GUIDE.md) 与 [reports/DEV_REPORT.md](reports/DEV_REPORT.md)。
+详细报告与答辩讲稿见：[reports/DEV_REPORT.md](reports/DEV_REPORT.md) · [docs/DEFENSE_GUIDE.md](docs/DEFENSE_GUIDE.md)。

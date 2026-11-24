@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
-from csi500_alpha.backtest import BarQuote, run_backtest
+from csi500_alpha.backtest import BarQuote, order_fee_rate, run_backtest
 from csi500_alpha.factors import align_industry_pit, align_quarterly_pit
 from csi500_alpha.fetch_csi500 import (
     BaoSession,
@@ -40,7 +40,7 @@ from csi500_alpha.projection import (
     precompute_eq_operator_numpy,
     project_portfolio_numpy,
 )
-from csi500_alpha.stats import cscv_pbo, deflated_sharpe_ratio, newey_west_t_stat
+from csi500_alpha.stats import cscv_pbo, deflated_sharpe_ratio, newey_west_t_stat, paired_return_test
 
 
 class TestWhiteboxDFL(unittest.TestCase):
@@ -144,9 +144,10 @@ class TestWhiteboxDFL(unittest.TestCase):
         ind_df = pd.DataFrame({
             "code": ["sz.000001", "sz.000001"],
             "industry": ["SW_801780_银行", "SW_801790_非银金融"],
-            "start_date": pd.to_datetime(["2020-01-01", "2024-04-15"]).astype("datetime64[ms]"),
+            "start_date": pd.to_datetime(["2023-12-01", "2024-04-15"]).astype("datetime64[ms]"),
         })
         ind_out = align_industry_pit(signals, ind_df)
+        self.assertEqual(ind_out.loc[0, "industry"], "Other")
         self.assertEqual(ind_out.loc[2, "industry"], "SW_801780_银行")
         self.assertEqual(ind_out.loc[3, "industry"], "SW_801790_非银金融")
 
@@ -404,6 +405,39 @@ class TestWhiteboxDFL(unittest.TestCase):
             self.assertIs(sock_util.send_msg, patched_orig)
         self.assertIs(socket.socket, orig_socket)
         self.assertEqual(socket.getdefaulttimeout(), orig_timeout)
+
+    def test_v2_strict_open_fees_participation_and_paired_stats(self) -> None:
+        self.assertAlmostEqual(order_fee_rate(pd.Timestamp("2023-08-25"), is_sell=False, fee_mode="ashare_realistic"), 0.0010)
+        self.assertAlmostEqual(order_fee_rate(pd.Timestamp("2023-08-25"), is_sell=True, fee_mode="ashare_realistic"), 0.0020)
+        self.assertAlmostEqual(order_fee_rate(pd.Timestamp("2023-08-28"), is_sell=True, fee_mode="ashare_realistic"), 0.0015)
+
+        days = pd.to_datetime(["2024-01-02", "2024-01-03"])
+        # Open tradable even when close_ok=False; prev_amount=100,000 with 5% participation caps buy at 5,000 RMB
+        bars = {
+            days[0]: {"sh.600000": BarQuote(10.0, np.nan, 10.0, 20.0, np.nan, open_tradable=True, close_ok=False, prev_amount=100_000.0)},
+            days[1]: {"sh.600000": BarQuote(10.0, 10.0, 10.0, 20.0, 20.0, open_tradable=True, close_ok=True, prev_amount=100_000.0)},
+        }
+        preds = pd.DataFrame({
+            "signal_date": [pd.Timestamp("2023-12-29")],
+            "entry_date": [days[0]],
+            "code": ["sh.600000"],
+            "target_weight": [0.5],
+        })
+        nav = run_backtest("cap_test", preds, bars, pd.DatetimeIndex(days), fee_mode="fixed_0bp", initial_cash=100_000.0, max_participation=0.05)
+        self.assertAlmostEqual(float(nav.loc[0, "gross_traded"]), 5_000.0, places=4)
+        self.assertEqual(int(nav.loc[0, "cap_clipped_orders"]), 1)
+
+        rng = np.random.default_rng(123)
+        bench = rng.normal(0.0002, 0.01, size=600)
+        ret_b = bench + rng.normal(0.0001, 0.002, size=600)
+        ret_a = ret_b + rng.normal(0.0004, 0.001, size=600)
+        res = paired_return_test(ret_a, ret_b, bench_ret=bench, lag=4, n_boot=300, block_size=10, seed=42)
+        self.assertGreater(res["nw_tstat"], 2.0)
+        self.assertLess(res["ann_diff_ci_lo"], res["ann_diff_ci_hi"])
+        mat = np.column_stack([ret_a - bench, ret_b - bench, rng.normal(0.0, 0.002, size=600)])
+        sr3, _ = deflated_sharpe_ratio(mat, 0, periods_per_year=252, n_trials_override=3)
+        sr10, _ = deflated_sharpe_ratio(mat, 0, periods_per_year=252, n_trials_override=10)
+        self.assertGreater(sr10, sr3)
 
 
 if __name__ == "__main__":
